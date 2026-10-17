@@ -1,0 +1,278 @@
+"""`glue`: generate JNI boilerplate for a kernel method.
+
+Given a pure static method, generates into ``--out``:
+
+- ``<Class>Native.java`` (default package): ``static native`` declarations
+  mirroring the kernel signature, plus ``System.loadLibrary("kernels")``.
+  The default package keeps JNI symbol names short (``Java_KernelsNative_dot``).
+- ``kernels_jni.cpp``: a pure-C++ helper ``kernel_<name>(...)`` per method
+  with a marked ``TODO(agent)`` spot where the calling agent pastes the
+  translated body, plus the ``JNIEXPORT`` wrapper that marshals
+  ``jintArray``/``jdouble``/... to raw pointers. Array parameters are
+  treated as in/out (copied back after the call) -- safe for differential
+  testing; the agent may narrow this when optimizing.
+- ``CMakeLists.txt``: builds ``libkernels.so`` with ``find_package(JNI)``.
+
+v0.1 supported types: ``void``, primitives
+(``byte/short/int/long/float/double/boolean/char``) and 1-D primitive
+arrays. Anything else (``String``, objects, 2-D arrays, generics) is
+rejected with a clear error.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+from . import java_ast as J
+
+# java type -> (jni type, c++ type, is_array, element c++ type)
+_TYPE_MAP: dict[str, tuple[str, str, bool, str]] = {
+    "byte": ("jbyte", "int8_t", False, ""),
+    "short": ("jshort", "int16_t", False, ""),
+    "int": ("jint", "int32_t", False, ""),
+    "long": ("jlong", "int64_t", False, ""),
+    "float": ("jfloat", "float", False, ""),
+    "double": ("jdouble", "double", False, ""),
+    "boolean": ("jboolean", "bool", False, ""),
+    "char": ("jchar", "char16_t", False, ""),
+    "void": ("void", "void", False, ""),
+    "byte[]": ("jbyteArray", "int8_t", True, "int8_t"),
+    "short[]": ("jshortArray", "int16_t", True, "int16_t"),
+    "int[]": ("jintArray", "int32_t", True, "int32_t"),
+    "long[]": ("jlongArray", "int64_t", True, "int64_t"),
+    "float[]": ("jfloatArray", "float", True, "float"),
+    "double[]": ("jdoubleArray", "double", True, "double"),
+    "boolean[]": ("jbooleanArray", "bool", True, "bool"),
+}
+
+_JNI_GET = {
+    "int8_t": ("GetByteArrayElements", "ReleaseByteArrayElements", "jbyte"),
+    "int16_t": ("GetShortArrayElements", "ReleaseShortArrayElements", "jshort"),
+    "int32_t": ("GetIntArrayElements", "ReleaseIntArrayElements", "jint"),
+    "int64_t": ("GetLongArrayElements", "ReleaseLongArrayElements", "jlong"),
+    "float": ("GetFloatArrayElements", "ReleaseFloatArrayElements", "jfloat"),
+    "double": ("GetDoubleArrayElements", "ReleaseDoubleArrayElements", "jdouble"),
+    "bool": ("GetBooleanArrayElements", "ReleaseBooleanArrayElements", "jboolean"),
+}
+_JNI_NEW = {
+    "int8_t": ("NewByteArray", "SetByteArrayRegion"),
+    "int16_t": ("NewShortArray", "SetShortArrayRegion"),
+    "int32_t": ("NewIntArray", "SetIntArrayRegion"),
+    "int64_t": ("NewLongArray", "SetLongArrayRegion"),
+    "float": ("NewFloatArray", "SetFloatArrayRegion"),
+    "double": ("NewDoubleArray", "SetDoubleArrayRegion"),
+    "bool": ("NewBooleanArray", "SetBooleanArrayRegion"),
+}
+
+
+@dataclass
+class GluePlan:
+    method: J.MethodInfo
+    native_class: str  # KernelsNative
+    jni_func: str  # Java_KernelsNative_dot
+    helper_name: str  # kernel_dot
+
+
+def _map(jtype: str) -> tuple[str, str, bool, str]:
+    try:
+        return _TYPE_MAP[jtype]
+    except KeyError:
+        raise ValueError(
+            f"unsupported type '{jtype}' for JNI glue in v0.1 "
+            f"(supported: void, primitives, 1-D primitive arrays)"
+        )
+
+
+def plan(method: J.MethodInfo) -> GluePlan:
+    if not method.is_static:
+        raise ValueError("glue in v0.1 requires a static method")
+    _map(method.jtype)
+    for p in method.params:
+        _map(p.jtype)
+    cls_simple = method.class_qualname.rsplit(".", 1)[-1]
+    native_class = f"{cls_simple}Native"
+    return GluePlan(
+        method=method,
+        native_class=native_class,
+        jni_func=f"Java_{native_class}_{method.name}",
+        helper_name=f"kernel_{method.name}",
+    )
+
+
+def _helper_params(method: J.MethodInfo) -> str:
+    parts = []
+    for p in method.params:
+        _jni, ctype, is_array, _elem = _map(p.jtype)
+        if is_array:
+            parts.append(f"const {ctype}* p_{p.name}, int p_{p.name}_len")
+        else:
+            parts.append(f"{ctype} p_{p.name}")
+    return ", ".join(parts)
+
+
+def _helper_call_args(method: J.MethodInfo) -> str:
+    parts = []
+    for p in method.params:
+        _jni, ctype, is_array, _elem = _map(p.jtype)
+        if is_array:
+            parts.append(f"p_{p.name}, p_{p.name}_len")
+        else:
+            parts.append(f"p_{p.name}")
+    return ", ".join(parts)
+
+
+def _helper_ret(method: J.MethodInfo) -> str:
+    _jni, ctype, is_array, _elem = _map(method.jtype)
+    if method.jtype == "void":
+        return "void"
+    if is_array:
+        return f"std::vector<{ctype}>"
+    return ctype
+
+
+def render_java(plan: GluePlan) -> str:
+    m = plan.method
+    lines = [
+        "// Generated by kernel-port. Do not hand-edit: regenerate with",
+        f"//   kernel-port glue --method {m.qualname}",
+        f"// JNI bindings for {m.qualname}",
+        "",
+        f"public class {plan.native_class} {{",
+        "    static {",
+        '        System.loadLibrary("kernels");',
+        "    }",
+        "",
+    ]
+    sig_params = []
+    java_params = ", ".join(f"{p.jtype} {p.name}" for p in m.params)
+    lines.append(f"    public static native {m.jtype} {m.name}({java_params});")
+    lines.append("}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_cpp(plan: GluePlan) -> str:
+    m = plan.method
+    hp = _helper_params(m)
+    hr = _helper_ret(m)
+
+    get_lines: list[str] = []
+    release_lines: list[str] = []
+    fwd_args: list[str] = []
+    for p in m.params:
+        jni_t, ctype, is_array, _elem = _map(p.jtype)
+        if is_array:
+            get_fn, rel_fn, jelem = _JNI_GET[ctype]
+            get_lines.append(
+                f"    jsize p_{p.name}_len = env->GetArrayLength({p.name});\n"
+                f"    {ctype}* p_{p.name} = reinterpret_cast<{ctype}*>(\n"
+                f"        env->{get_fn}({p.name}, nullptr));"
+            )
+            # in/out: copy back on release (mode 0)
+            release_lines.append(
+                f"    env->{rel_fn}({p.name}, reinterpret_cast<{jelem}*>(\n"
+                f"        p_{p.name}), 0);"
+            )
+            fwd_args.append(f"p_{p.name}, p_{p.name}_len")
+        else:
+            fwd_args.append(p.name)
+
+    jni_params = []
+    for p in m.params:
+        jni_t, _c, _a, _e = _map(p.jtype)
+        jni_params.append(f"{jni_t} {p.name}")
+    jni_sig = ", ".join(["JNIEnv* env", "jclass"] + jni_params)
+    jni_ret = _map(m.jtype)[0]
+
+    # return-value marshaling
+    ret_marshal: list[str] = []
+    call_expr: str
+    if m.jtype == "void":
+        call_expr = f"{plan.helper_name}({', '.join(fwd_args)});"
+    else:
+        _jr, ctype, is_array, _elem = _map(m.jtype)
+        if is_array:
+            new_fn, set_fn = _JNI_NEW[ctype]
+            call_expr = f"std::vector<{ctype}> result = {plan.helper_name}({', '.join(fwd_args)});"
+            ret_marshal = [
+                f"    {jni_ret} out = env->{new_fn}((jsize)result.size());",
+                f"    env->{set_fn}(out, 0, (jsize)result.size(),",
+                f"                 reinterpret_cast<const {_JNI_GET[ctype][2]}*>(result.data()));",
+                "    return out;",
+            ]
+        else:
+            call_expr = f"{ctype} result = {plan.helper_name}({', '.join(fwd_args)});"
+            ret_marshal = ["    return result;"]
+
+    body = [
+        "// Generated by kernel-port JNI glue.",
+        "// The calling agent pastes the translated C++ body into the",
+        f"// {plan.helper_name}() function below (marked TODO(agent)).",
+        "//",
+        "// Array parameters are treated as IN/OUT: the wrapper copies them",
+        "// back after the call. Narrow this if the kernel only reads them.",
+        "",
+        "#include <jni.h>",
+        "#include <cstdint>",
+        "#include <vector>",
+        "",
+        "// ---- Translated kernel (filled in by the agent) ----",
+        f"static {hr} {plan.helper_name}({hp}) {{",
+        "    // ==== BEGIN TRANSLATED BODY ====",
+        f"    // TODO(agent): paste the translated body of {m.qualname} here.",
+        "    // It must compute exactly what the Java original computes.",
+    ]
+    if hr == "void":
+        body.append("    // ==== END TRANSLATED BODY ====")
+        body.append("}")
+    elif hr.startswith("std::vector"):
+        body.append("    return {}; // placeholder")
+        body.append("    // ==== END TRANSLATED BODY ====")
+        body.append("}")
+    else:
+        body.append("    return 0; // placeholder")
+        body.append("    // ==== END TRANSLATED BODY ====")
+        body.append("}")
+    body += [
+        "",
+        "extern \"C\" {",
+        "",
+        f"JNIEXPORT {jni_ret} JNICALL {plan.jni_func}({jni_sig}) {{",
+        *get_lines,
+        f"    {call_expr}",
+        *release_lines,
+        *ret_marshal,
+        "}",
+        "",
+        '} // extern "C"',
+        "",
+    ]
+    return "\n".join(body)
+
+
+def render_cmake() -> str:
+    return """# Generated by kernel-port.
+cmake_minimum_required(VERSION 3.16)
+project(kernels_jni)
+find_package(JNI REQUIRED)
+add_library(kernels SHARED kernels_jni.cpp)
+target_include_directories(kernels PRIVATE ${JNI_INCLUDE_DIRS})
+set_target_properties(kernels PROPERTIES CXX_STANDARD 17)
+"""
+
+
+def generate(method: J.MethodInfo, out_dir: Path) -> dict[str, Path]:
+    """Write glue files; return {kind: path}."""
+    gp = plan(method)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    files = {
+        "java": out_dir / f"{gp.native_class}.java",
+        "cpp": out_dir / "kernels_jni.cpp",
+        "cmake": out_dir / "CMakeLists.txt",
+    }
+    files["java"].write_text(render_java(gp), encoding="utf-8")
+    files["cpp"].write_text(render_cpp(gp), encoding="utf-8")
+    files["cmake"].write_text(render_cmake(), encoding="utf-8")
+    return files

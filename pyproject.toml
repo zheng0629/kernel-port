@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kernel-port"
+version = "0.1.0"
+description = "Agent-callable toolchain: mine pure-compute kernels from Java repos, extract them with purity proofs, generate JNI glue, and verify + benchmark C++ translations."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["jni", "transpilation", "static-analysis", "benchmark"]
+dependencies = [
+    "typer>=0.9",
+    "rich>=13",
+    "tree-sitter>=0.25",
+    "tree-sitter-java>=0.23",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+kernel-port = "kernel_port.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["fixtures"]
