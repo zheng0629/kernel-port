@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from . import java_ast as J
-from .purity import PurityReport, _PurityChecker
+from .purity import ClassPurityReport, PurityReport, _PurityChecker, check_class_portable
 
 
 @dataclass
@@ -131,8 +131,21 @@ def extract(repo: J.JavaRepo, qualname: str) -> Extraction:
                 "v0.1 requires a unique method name"
             )
         raise ValueError(f"method not found: {qualname}")
+    return _extract_method(repo, method)
+
+
+def _extract_method(
+    repo: J.JavaRepo, method: J.MethodInfo, purity: PurityReport | None = None
+) -> Extraction:
+    """Extract a kernel given its MethodInfo.
+
+    An explicit `purity` report may be supplied (class extraction passes the
+    class-context report, which understands final instance fields); when
+    omitted, the standard per-method check is used.
+    """
     checker = _PurityChecker(repo)
-    purity = checker.check(method)
+    if purity is None:
+        purity = checker.check(method)
 
     closure: list[ClosureMember] = []
     seen: set[str] = {method.qualname}
@@ -227,4 +240,113 @@ def to_json(ext: Extraction) -> dict:
             }
             for c in ext.closure
         ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Class-level extraction (workstream C2)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ClassExtraction:
+    class_info: J.ClassInfo
+    class_purity: ClassPurityReport
+    method_extractions: list[Extraction] = field(default_factory=list)
+    fields: list[J.FieldInfo] = field(default_factory=list)
+
+
+def extract_class(repo: J.JavaRepo, class_qualname: str) -> ClassExtraction:
+    """Extract a whole class: every method (constructors first) plus fields.
+
+    Per-method purity reports come from the class-context check, so reads of
+    final instance fields in an immutable class count as pure.
+    """
+    cls = repo.classes.get(class_qualname)
+    if cls is None:
+        raise ValueError(f"class not found: {class_qualname}")
+    purity = check_class_portable(cls, repo)
+    methods = sorted(cls.all_methods, key=lambda m: (not m.is_constructor, m.name))
+    extractions = [
+        _extract_method(repo, m, purity.method_reports.get(m.qualname))
+        for m in methods
+    ]
+    return ClassExtraction(
+        class_info=cls,
+        class_purity=purity,
+        method_extractions=extractions,
+        fields=list(cls.fields.values()),
+    )
+
+
+def render_text_class(ext: ClassExtraction) -> str:
+    """Human/agent-readable prompt material for a whole class."""
+    cls = ext.class_info
+    rep = ext.class_purity
+    lines = [
+        "# kernel-port class extraction",
+        "",
+        f"Class:     {cls.qualname}",
+        f"Kind:      {rep.kind}",
+        f"Location:  {cls.file}",
+        f"Purity:    {'PORTABLE' if rep.portable else 'NOT PORTABLE'}",
+    ]
+    if not rep.portable:
+        lines.append("Reasons:")
+        for r in rep.reasons:
+            lines.append(f"  - {r}")
+        lines += [
+            "",
+            "Refusing to emit translation material: the class is not portable",
+            "as a unit. Fix the reasons above or pick another candidate.",
+        ]
+        return "\n".join(lines)
+    lines.append("Methods:")
+    for e in ext.method_extractions:
+        verdict = "PURE" if e.purity.pure else "IMPURE"
+        lines.append(f"  - {e.method.signature} [{verdict}]")
+    if ext.fields:
+        lines.append("Fields:")
+        for f in ext.fields:
+            mods = " ".join(sorted(f.modifiers))
+            lines.append(f"  - {f.jtype} {f.name}" + (f" ({mods})" if mods else ""))
+    else:
+        lines.append("Fields:    (none)")
+    for f in ext.fields:
+        lines += ["", f"## Field: {f.qualname}", "", "```java", f.source, "```"]
+    for e in ext.method_extractions:
+        lines += ["", f"## Source: {e.method.qualname}", "", "```java", e.method.source, "```"]
+    lines += [
+        "",
+        "## Translation notes for the LLM",
+        "- Target language: C++17. Keep the exact signature semantics.",
+        "- Stateless classes become a C++ namespace or a class of statics;",
+        "  immutable classes become a C++ struct/class with const members.",
+        "- Only the bodies above need translation; kernel-port generates the",
+        "  JNI glue separately.",
+        "- Preserve floating-point operation order; do not introduce",
+        "  reassociation unless the differential test still passes.",
+    ]
+    return "\n".join(lines)
+
+
+def to_json_class(ext: ClassExtraction) -> dict:
+    cls = ext.class_info
+    rep = ext.class_purity
+    return {
+        "class": cls.qualname,
+        "kind": rep.kind,
+        "file": cls.file,
+        "portable": rep.portable,
+        "portability_reasons": rep.reasons,
+        "fields": [
+            {
+                "name": f.name,
+                "type": f.jtype,
+                "modifiers": sorted(f.modifiers),
+                "source": f.source,
+            }
+            for f in ext.fields
+        ],
+        "methods": [to_json(e) for e in ext.method_extractions],
     }

@@ -25,14 +25,17 @@ share a length, so dot(a,b) style kernels get matching inputs.
 
 from __future__ import annotations
 
+import json
+import math
 import queue
 import random
+import re
 import shutil
 import statistics
 import subprocess
 import sys
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import java_ast as J
@@ -203,15 +206,134 @@ def gen_bench_args(method: J.MethodInfo, seed: int = 1234, array_len: int = 512)
     return gen_case(method, rng, array_len=array_len, bench=True)
 
 
+# ---------------------------------------------------------------------------
+# boundary-value generation
+# ---------------------------------------------------------------------------
+
+#: Cap on boundary cases per method (deterministic order; first N are kept).
+_BOUNDARY_CAP = 24
+
+_INT_EDGES = [0, 1, -1, -(2**31), 2**31 - 1]
+_LONG_EDGES = [0, 1, -1, -(2**63), 2**63 - 1]
+_DOUBLE_EDGES = [
+    0.0,
+    -0.0,
+    1.0,
+    -1.0,
+    float("nan"),
+    float("inf"),
+    float("-inf"),
+    5e-324,  # smallest positive subnormal
+    sys.float_info.max,
+]
+_FLOAT_EDGES = [
+    0.0,
+    -0.0,
+    1.0,
+    -1.0,
+    float("nan"),
+    float("inf"),
+    float("-inf"),
+    1.1754944e-38,  # FLT_MIN
+    3.4028235e38,  # FLT_MAX
+]
+_LARGE_ARRAY_LEN = 1024
+
+
+def _boundary_scalar_edges(jtype: str) -> list:
+    if jtype == "int":
+        return list(_INT_EDGES)
+    if jtype == "long":
+        return list(_LONG_EDGES)
+    if jtype == "float":
+        return list(_FLOAT_EDGES)
+    if jtype == "double":
+        return list(_DOUBLE_EDGES)
+    if jtype == "boolean":
+        return [False, True]
+    raise AssertionError(jtype)
+
+
+def _boundary_array_edges(jtype: str, rng: random.Random) -> list:
+    elem = jtype[:-2]
+    zero = _boundary_scalar_edges(elem)[0]
+    single = 2.5 if elem in ("float", "double") else 7
+    if elem in ("float", "double"):
+        big = [rng.uniform(-100.0, 100.0) for _ in range(_LARGE_ARRAY_LEN)]
+    else:
+        big = [rng.randint(-1000, 1000) for _ in range(_LARGE_ARRAY_LEN)]
+    return [[], [zero], [single], big]
+
+
+def gen_boundary_cases(
+    method: J.MethodInfo, rng: random.Random | None = None
+) -> list[list]:
+    """Deterministic boundary-value argument lists for `method`.
+
+    Edge values per parameter type:
+
+    - int/long: 0, 1, -1, MIN, MAX
+    - float/double: 0.0, -0.0, 1.0, -1.0, NaN, +Inf, -Inf, tiny, max
+    - boolean: False, True
+    - arrays: [], [zero], [single value], large (1024-element) array
+
+    Combination is deliberately simple and deterministic: one all-neutral
+    case (the first edge of every parameter), then each parameter swept
+    across its remaining edges while the others stay neutral. Combinations
+    that fall outside the kernel's valid domain (mismatched array lengths,
+    gigantic allocations, ...) are skipped by the Java-first protocol in
+    :func:`run_verify`, so generation stays best-effort. The list is capped
+    at ``_BOUNDARY_CAP`` (24) cases in deterministic order.
+    """
+    r = rng if rng is not None else random.Random(0xC0FFEE)
+    edge_lists: list[list] = []
+    for p in method.params:
+        if p.jtype.endswith("[]"):
+            edge_lists.append(_boundary_array_edges(p.jtype, r))
+        else:
+            edge_lists.append(_boundary_scalar_edges(p.jtype))
+    if not edge_lists:
+        return [[]]
+    cases = [[edges[0] for edges in edge_lists]]
+    seen = {repr(cases[0])}
+    for i, edges in enumerate(edge_lists):
+        for v in edges[1:]:
+            case = [edge_lists[j][0] for j in range(len(edge_lists))]
+            case[i] = v
+            key = repr(case)
+            if key in seen:
+                continue
+            seen.add(key)
+            cases.append(case)
+            if len(cases) >= _BOUNDARY_CAP:
+                return cases
+    return cases
+
+
+def _encode_fp(value) -> str:
+    """Java-parseable rendering of a float/double.
+
+    Python's repr() spells NaN/Infinity as 'nan'/'inf'/'-inf', which
+    Double/Float.parseDouble reject (NumberFormatException). Map them to
+    the spellings Java accepts so edge values survive the wire protocol.
+    """
+    f = float(value)
+    if math.isnan(f):
+        return "NaN"
+    if math.isinf(f):
+        return "Infinity" if f > 0 else "-Infinity"
+    return repr(f)
+
+
 def encode_arg(jtype: str, value) -> str:
     if jtype == "int":
         return f"i:{int(value)}"
     if jtype == "long":
         return f"l:{int(value)}"
     if jtype == "float":
-        return f"f:{float(value)!r}"
+        return f"f:{_encode_fp(value)}"
     if jtype == "double":
-        return f"d:{float(value)!r}"
+        return f"d:{_encode_fp(value)}"
     if jtype == "boolean":
         return f"z:{1 if value else 0}"
     if jtype in ("int[]", "long[]", "float[]", "double[]"):
@@ -253,13 +375,6 @@ def _parse_result_token(tok: str):
 
 def results_equal(method: J.MethodInfo, java_tok: str, jni_tok: str) -> tuple[bool, str]:
     """Compare two result tokens; floats compare with tolerance."""
-    if java_tok == "v" or jni_tok == "v":
-        return (java_tok == jni_tok, "" if java_tok == jni_tok else "void mismatch")
-    try:
-        tj, vj = _parse_result_token(java_tok)
-        tn, vn = _parse_result_token(jni_tok)
-    except ValueError as e:
-        return False, str(e)
 
     def close(a: float, b: float) -> bool:
         import math
@@ -269,6 +384,40 @@ def results_equal(method: J.MethodInfo, java_tok: str, jni_tok: str) -> tuple[bo
         if math.isinf(a) or math.isinf(b):
             return a == b
         return abs(a - b) <= 1e-9 + 1e-9 * max(abs(a), abs(b))
+
+    if java_tok == "v" or jni_tok == "v":
+        return (java_tok == jni_tok, "" if java_tok == jni_tok else "void mismatch")
+    if java_tok.startswith("v|") or jni_tok.startswith("v|"):
+        # void method with mutated-array echo: "v|ad:1.0,2.0|ai:3"
+        if not (java_tok.startswith("v|") and jni_tok.startswith("v|")):
+            return False, "void/array-echo shape mismatch"
+        jsegs = java_tok[2:].split("|")
+        nsegs = jni_tok[2:].split("|")
+        if len(jsegs) != len(nsegs):
+            return False, f"array count mismatch: {len(jsegs)} vs {len(nsegs)}"
+        for js, ns in zip(jsegs, nsegs):
+            try:
+                tj, vj = _parse_result_token(js)
+                tn, vn = _parse_result_token(ns)
+            except ValueError as e:
+                return False, str(e)
+            if tj != tn or not isinstance(vj, list) or not isinstance(vn, list):
+                return False, f"array type mismatch: {js!r} vs {ns!r}"
+            if len(vj) != len(vn):
+                return False, f"array length mismatch: {len(vj)} vs {len(vn)}"
+            floaty = tj in ("af", "ad")
+            for a, b in zip(vj, vn):
+                if floaty:
+                    if not close(a, b):
+                        return False, f"array element mismatch: {a} != {b}"
+                elif a != b:
+                    return False, f"array element mismatch: {a} != {b}"
+        return True, ""
+    try:
+        tj, vj = _parse_result_token(java_tok)
+        tn, vn = _parse_result_token(jni_tok)
+    except ValueError as e:
+        return False, str(e)
 
     if tj in ("ai", "al"):
         ok = isinstance(vn, list) and len(vj) == len(vn) and all(x == y for x, y in zip(vj, vn))
@@ -384,7 +533,15 @@ def render_harness(method: J.MethodInfo, target: str, class_name: str) -> str:
     call_args_direct = ", ".join(f"b_a{i}" for i in range(len(params)))
     call_direct = f"{receiver}.{method.name}({call_args_direct})"
     if is_void:
-        direct_stmt = f"{call_direct};\n            return \"OK v\";"
+        # Void methods communicate through mutated array params: echo them
+        # back so differential testing actually compares something.
+        # Token: "v" (no array params) or "v|ad:1.0,2.0|ai:3" (array echo).
+        _echo_parts = []
+        for _i, _p in enumerate(params):
+            if _p.jtype.endswith("[]"):
+                _echo_parts.append(f' + "|" + {_encode_java(_p.jtype, f"b_a{_i}")}')
+        _echo = "".join(_echo_parts)
+        direct_stmt = f"{call_direct};\n            return \"OK v\"{_echo};"
     else:
         direct_stmt = (
             f"{_JAVA_DECL[method.jtype]} r = {call_direct};\n"
@@ -604,6 +761,8 @@ class VerifyCase:
     args: list
     ok: bool
     detail: str = ""
+    java_result: str = ""  # raw result token from the Java harness ("d:1.5", "v", ...)
+    jni_result: str = ""  # raw result token from the JNI harness
 
 
 @dataclass
@@ -613,10 +772,155 @@ class VerifyReport:
     passed: int
     failed: int
     skipped: int = 0
+    boundary: list[VerifyCase] = field(default_factory=list)
+    boundary_skipped: int = 0
 
     @property
     def all_passed(self) -> bool:
-        return self.failed == 0
+        # Boundary mismatches fail the run too: they are real translation
+        # bugs caught by the edge-case sweep. With boundary=False the list
+        # is empty, so this reduces to the v0.1 definition.
+        return self.failed == 0 and self.boundary_failed == 0
+
+    @property
+    def boundary_passed(self) -> int:
+        return sum(1 for c in self.boundary if c.ok)
+
+    @property
+    def boundary_failed(self) -> int:
+        return sum(1 for c in self.boundary if not c.ok)
+
+
+def _run_one_case(
+    s_java: LineSession,
+    s_jni: LineSession,
+    method: J.MethodInfo,
+    index: int,
+    args: list,
+    timeout: float,
+) -> tuple[VerifyCase | None, bool, bool]:
+    """Run one differential case through both sessions.
+
+    Returns ``(case, skipped, java_no_answer)``:
+
+    - ``skipped`` (case None): the Java original rejected the input as
+      out-of-domain -- the caller counts it as skipped without feeding it
+      to native code, which has no bounds checking.
+    - ``java_no_answer``: the Java side timed out or died, so there is no
+      reference answer to compare against. The case is inconclusive (it is
+      returned as a failed VerifyCase for the caller to classify).
+    """
+    line = encode_call(method, args)
+    try:
+        rj = s_java.ask(line, timeout)
+    except (TimeoutError, RuntimeError) as e:
+        return VerifyCase(index, args, False, f"java harness error: {e}"), False, True
+    if rj.startswith("ERR"):
+        return None, True, False
+    if not rj.startswith("OK "):
+        return VerifyCase(index, args, False, f"protocol error: {rj!r}"), False, False
+    try:
+        rn = s_jni.ask(line, timeout)
+    except (TimeoutError, RuntimeError) as e:
+        return (
+            VerifyCase(
+                index, args, False, f"jni harness error: {e}", java_result=rj[3:]
+            ),
+            False,
+            False,
+        )
+    if rn.startswith("ERR"):
+        return (
+            VerifyCase(
+                index,
+                args,
+                False,
+                f"jni harness threw: {rn}",
+                java_result=rj[3:],
+                jni_result=rn,
+            ),
+            False,
+            False,
+        )
+    if not rn.startswith("OK "):
+        return (
+            VerifyCase(
+                index, args, False, f"protocol error: {rn!r}", java_result=rj[3:]
+            ),
+            False,
+            False,
+        )
+    ok, detail = results_equal(method, rj[3:], rn[3:])
+    return (
+        VerifyCase(index, args, ok, detail, java_result=rj[3:], jni_result=rn[3:]),
+        False,
+        False,
+    )
+
+
+def _json_safe(value):
+    """Recursively convert a value to JSON-safe form.
+
+    NaN/Infinity floats are not valid JSON, so they become their repr()
+    strings ("nan", "inf", "-inf"); counterex.py renders those readably.
+    """
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return repr(value)
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    return value
+
+
+def _safe_method_filename(qualname: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", qualname)
+
+
+def _persist_failures(env: BuiltEnv, report: VerifyReport) -> Path | None:
+    """Write failing cases to ``<work>/.kp-work/<method>.failures.json``.
+
+    Each entry holds JSON-safe ``args`` (NaN/Infinity as repr strings),
+    ``java_result`` / ``jni_result`` tokens, ``detail``, and whether the
+    case came from the ``boundary`` sweep. Never raises: when the work dir
+    is unavailable the failures are dropped silently (the report itself is
+    still returned normally).
+    """
+    try:
+        entries: list[dict] = []
+        for c in report.cases:
+            if not c.ok:
+                entries.append(
+                    {
+                        "args": _json_safe(c.args),
+                        "java_result": c.java_result,
+                        "jni_result": c.jni_result,
+                        "detail": c.detail,
+                        "boundary": False,
+                    }
+                )
+        for c in report.boundary:
+            if not c.ok:
+                entries.append(
+                    {
+                        "args": _json_safe(c.args),
+                        "java_result": c.java_result,
+                        "jni_result": c.jni_result,
+                        "detail": c.detail,
+                        "boundary": True,
+                    }
+                )
+        if not entries:
+            return None
+        out_dir = Path(env.work) / ".kp-work"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"{_safe_method_filename(report.method)}.failures.json"
+        path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+        return path
+    except Exception:
+        return None
 
 
 def run_verify(
@@ -624,11 +928,26 @@ def run_verify(
     cases: int = 100,
     seed: int = 42,
     per_case_timeout: float = 30.0,
+    boundary: bool = True,
+    boundary_cases: int = 24,
 ) -> VerifyReport:
+    """Differential-test the JNI translation against the Java original.
+
+    ``cases`` random inputs are generated exactly as in v0.1. When
+    ``boundary`` is true, up to ``boundary_cases`` deterministic edge-case
+    inputs (see :func:`gen_boundary_cases`) run through the same sessions
+    afterwards and are reported separately in ``report.boundary``;
+    ``report.cases`` keeps holding only the random cases, so existing count
+    assertions still hold. Failing cases (random and boundary) are persisted
+    to ``<work>/.kp-work/<method>.failures.json`` for counterexample
+    feedback (see :func:`_persist_failures`).
+    """
     rng = random.Random(seed)
     s_java, s_jni = open_sessions(env)
     results: list[VerifyCase] = []
     skipped = 0
+    b_results: list[VerifyCase] = []
+    b_skipped = 0
     attempts = 0
     max_attempts = cases * 3 + 10
     try:
@@ -636,50 +955,72 @@ def run_verify(
             attempts += 1
             i = attempts - 1
             args = gen_case(env.method, rng)
-            line = encode_call(env.method, args)
-            try:
-                rj = s_java.ask(line, per_case_timeout)
-            except (TimeoutError, RuntimeError) as e:
-                results.append(VerifyCase(i, args, False, f"java harness error: {e}"))
-                continue
-            if rj.startswith("ERR"):
-                # The Java original itself rejects this input (out of the
-                # kernel's valid domain): discard the case without feeding
-                # it to native code, which has no bounds checking.
+            case, was_skipped, _java_no_answer = _run_one_case(
+                s_java, s_jni, env.method, i, args, per_case_timeout
+            )
+            if was_skipped:
                 skipped += 1
                 continue
-            if not rj.startswith("OK "):
-                results.append(VerifyCase(i, args, False, f"protocol error: {rj!r}"))
-                continue
-            try:
-                rn = s_jni.ask(line, per_case_timeout)
-            except (TimeoutError, RuntimeError) as e:
-                results.append(VerifyCase(i, args, False, f"jni harness error: {e}"))
-                continue
-            if rn.startswith("ERR"):
-                results.append(VerifyCase(i, args, False, f"jni harness threw: {rn}"))
-                continue
-            if not rn.startswith("OK "):
-                results.append(VerifyCase(i, args, False, f"protocol error: {rn!r}"))
-                continue
-            ok, detail = results_equal(env.method, rj[3:], rn[3:])
-            results.append(VerifyCase(i, args, ok, detail))
+            assert case is not None
+            results.append(case)
+        if boundary:
+            for bi, bargs in enumerate(
+                gen_boundary_cases(env.method)[:boundary_cases]
+            ):
+                case, was_skipped, java_no_answer = _run_one_case(
+                    s_java, s_jni, env.method, bi, bargs, per_case_timeout
+                )
+                if was_skipped:
+                    b_skipped += 1
+                    continue
+                assert case is not None
+                if java_no_answer:
+                    # The reference implementation itself did not answer in
+                    # time (e.g. fib(INT_MAX) needs billions of loop
+                    # iterations): the case is inconclusive, not a
+                    # translation bug, so it is skipped rather than failed.
+                    # Reopen the sessions -- a timed-out session may be
+                    # desynced, with a late answer landing in the next ask.
+                    b_skipped += 1
+                    s_java.close()
+                    s_jni.close()
+                    s_java, s_jni = open_sessions(env)
+                    continue
+                b_results.append(case)
     finally:
         s_java.close()
         s_jni.close()
     passed = sum(1 for c in results if c.ok)
-    return VerifyReport(
+    report = VerifyReport(
         method=env.method.qualname,
         cases=results,
         passed=passed,
         failed=len(results) - passed,
         skipped=skipped,
+        boundary=b_results,
+        boundary_skipped=b_skipped,
     )
+    _persist_failures(env, report)
+    return report
 
 
 # ---------------------------------------------------------------------------
 # bench
 # ---------------------------------------------------------------------------
+
+
+#: Heuristic break-even bar: a port counts as "worth it" once JNI beats
+#: Java by more than 20%. The headroom absorbs measurement noise and the
+#: gap between microbenchmark conditions and real call sites.
+_BREAK_EVEN_SPEEDUP = 1.2
+
+
+def _break_even_size(per_size: list[dict]) -> int | None:
+    """Smallest size with speedup > 1.2 (the heuristic bar), else None."""
+    for entry in sorted(per_size, key=lambda e: e["size"]):
+        if entry.get("speedup", 0) > _BREAK_EVEN_SPEEDUP:
+            return entry["size"]
+    return None
 
 
 @dataclass
@@ -689,6 +1030,18 @@ class BenchReport:
     warmup: int
     java_nanos: list[int]
     jni_nanos: list[int]
+    # --- v0.2 additions (all defaulted; old constructions keep working) ---
+    jni_overhead_ns: float | None = None  # median ns per empty JNI call
+    per_size: list[dict] = field(
+        default_factory=list
+    )  # [{size, java_ns, jni_ns, speedup}] (median per-call ns)
+    break_even_size: int | None = None  # derived from per_size when not given
+    rigorous_note: str = ""
+    ci95_half_width_ns: float | None = None  # 95% CI half-width, trimmed JNI per-call
+
+    def __post_init__(self) -> None:
+        if self.break_even_size is None and self.per_size:
+            self.break_even_size = _break_even_size(self.per_size)
 
     @property
     def java_per_call_ns(self) -> float:
@@ -703,6 +1056,286 @@ class BenchReport:
         j = self.jni_per_call_ns
         return self.java_per_call_ns / j if j > 0 else float("inf")
 
+    @property
+    def compute_ns(self) -> float:
+        """JNI per-call time attributable to the kernel itself.
+
+        Subtracts the measured empty-call overhead (the JNI transition
+        cost); floored at 0 so an imprecise overhead estimate can never go
+        negative. Without a measured overhead this is just jni_per_call_ns.
+        """
+        base = self.jni_per_call_ns
+        if self.jni_overhead_ns is None:
+            return base
+        return max(0.0, base - self.jni_overhead_ns)
+
+
+def _bench_samples(
+    s_java: LineSession,
+    s_jni: LineSession,
+    method: J.MethodInfo,
+    args: list,
+    iters: int,
+    warmup: int,
+    repeats: int,
+    timeout: float,
+) -> tuple[list[int], list[int]]:
+    """Timed BENCH loop for one input; returns (java_nanos, jni_nanos).
+
+    Same contract as v0.1 run_bench: raises RuntimeError when the input is
+    invalid for the Java original or a harness misbehaves.
+    """
+    # sanity: the representative input must be valid for the Java original
+    probe = s_java.ask(encode_call(method, args), timeout)
+    if probe.startswith("ERR"):
+        raise RuntimeError(
+            f"generated benchmark input is invalid for the Java original: {probe}. "
+            "This is a v0.1 input-heuristic limitation."
+        )
+    if not probe.startswith("OK "):
+        raise RuntimeError(f"protocol error: {probe!r}")
+    bench_line = f"BENCH {iters} " + " ".join(
+        encode_arg(p.jtype, v) for p, v in zip(method.params, args)
+    )
+    warm_line = f"BENCH {warmup} " + " ".join(
+        encode_arg(p.jtype, v) for p, v in zip(method.params, args)
+    )
+    j_ns: list[int] = []
+    n_ns: list[int] = []
+    for rep in range(repeats):
+        for sess, store in ((s_java, j_ns), (s_jni, n_ns)):
+            r = sess.ask(warm_line, timeout)  # warmup, discarded
+            if r.startswith("ERR"):
+                raise RuntimeError(f"harness error during warmup: {r}")
+            r = sess.ask(bench_line, timeout)
+            if r.startswith("ERR"):
+                raise RuntimeError(f"harness error during bench: {r}")
+            if not r.startswith("OK "):
+                raise RuntimeError(f"protocol error: {r!r}")
+            store.append(int(r[3:]))
+    return j_ns, n_ns
+
+
+def _size_entry(
+    size: int,
+    java_ns: list[int],
+    jni_ns: list[int],
+    iters: int,
+    trim: bool = False,
+) -> dict:
+    if trim:
+        java_ns = _iqr_trim(java_ns)
+        jni_ns = _iqr_trim(jni_ns)
+    jm = statistics.median(java_ns) / iters
+    nm = statistics.median(jni_ns) / iters
+    return {
+        "size": size,
+        "java_ns": jm,
+        "jni_ns": nm,
+        "speedup": jm / nm if nm > 0 else float("inf"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# rigorous mode: JMH / Google Benchmark detection + honest wall-clock fallback
+# ---------------------------------------------------------------------------
+
+
+def _find_jmh_jar() -> Path | None:
+    """Look for a JMH core jar: ~/.m2, `jmh` on PATH, then a bounded find."""
+    try:
+        m2 = Path.home() / ".m2" / "repository"
+        if m2.is_dir():
+            for p in sorted(m2.glob("**/jmh-core-*.jar")):
+                return p
+        jmh = shutil.which("jmh")
+        if jmh:
+            return Path(jmh)
+        r = subprocess.run(
+            ["find", "/", "-maxdepth", "4", "-name", "jmh-core-*.jar"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line:
+                return Path(line)
+    except Exception:
+        pass
+    return None
+
+
+def _google_benchmark_available() -> bool:
+    """True when <benchmark/benchmark.h> compiles (header check only)."""
+    import tempfile
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "gb_probe.cpp"
+            src.write_text(
+                "#include <benchmark/benchmark.h>\nint main() { return 0; }\n",
+                encoding="utf-8",
+            )
+            r = subprocess.run(
+                [_which_or_raise("g++"), "-fsyntax-only", str(src)],
+                capture_output=True,
+                timeout=60,
+            )
+            # NOTE: -fsyntax-only proves the headers exist; linking a real
+            # benchmark would additionally need -lbenchmark.
+            return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _iqr_trim(samples: list) -> list:
+    """Drop samples outside [Q1 - 1.5*IQR, Q3 + 1.5*IQR].
+
+    With fewer than 4 samples there is no meaningful IQR, and the trimmed
+    list never shrinks below 3 points (a median of 1-2 survivors is noise,
+    not rigor).
+    """
+    if len(samples) < 4:
+        return list(samples)
+    q1, _q2, q3 = statistics.quantiles(samples, n=4, method="exclusive")
+    iqr = q3 - q1
+    lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+    trimmed = [s for s in samples if lo <= s <= hi]
+    return trimmed if len(trimmed) >= 3 else list(samples)
+
+
+def _ci95_half_width(per_call_ns: list[float]) -> float | None:
+    """95% CI half-width of the mean via normal approx (1.96*sd/sqrt(n))."""
+    if len(per_call_ns) < 2:
+        return None
+    return 1.96 * statistics.pstdev(per_call_ns) / math.sqrt(len(per_call_ns))
+
+
+def _apply_rigorous(
+    report: BenchReport,
+    size_samples: list[tuple[int, list[int], list[int]]],
+) -> BenchReport:
+    """Enhanced wall-clock mode used whenever rigorous=True is requested.
+
+    JMH / Google Benchmark are *detected* but never faked: when neither is
+    installed the report says exactly that and falls back to IQR outlier
+    trimming plus a 95% CI half-width. When one IS installed the note names
+    it, and the same enhanced wall-clock numbers are still reported --
+    presenting wall-clock data as JMH output would be dishonest.
+    """
+    jmh_jar = _find_jmh_jar()
+    gb = _google_benchmark_available()
+    # NOTE (future work): when a real framework is present, a later pass
+    # could shell out to it instead of the wall-clock loop, e.g.
+    #   java -cp <jmh-core.jar>:<classes> org.openjdk.jmh.Main <BenchClass>
+    # or compile a google/benchmark driver that calls the JNI wrapper and
+    # parse its JSON output. v0.1 deliberately does NOT do that: it reports
+    # the enhanced wall-clock numbers below and says so, rather than
+    # presenting wall-clock data as framework results.
+    if jmh_jar is not None or gb:
+        found = []
+        if jmh_jar is not None:
+            found.append(f"JMH ({jmh_jar})")
+        if gb:
+            found.append("Google Benchmark headers")
+        report.rigorous_note = (
+            f"Detected {' and '.join(found)}; v0.1 still uses the enhanced "
+            "wall-clock (IQR outlier trimming + 95% CI) -- shelling out to a "
+            "real framework is future work (see _apply_rigorous comments)."
+        )
+    else:
+        report.rigorous_note = (
+            "JMH/Google Benchmark not available; using wall-clock with "
+            "IQR outlier trimming and 95% CI"
+        )
+    # In rigorous mode the stored sample lists hold the IQR-trimmed samples,
+    # so every downstream number (medians, speedup, compute_ns) is computed
+    # on cleaned data.
+    report.java_nanos = _iqr_trim(report.java_nanos)
+    report.jni_nanos = _iqr_trim(report.jni_nanos)
+    report.ci95_half_width_ns = _ci95_half_width(
+        [ns / report.iters for ns in report.jni_nanos]
+    )
+    report.per_size = [
+        _size_entry(size, sj, sn, report.iters, trim=True)
+        for size, sj, sn in sorted(size_samples, key=lambda t: t[0])
+    ]
+    report.break_even_size = _break_even_size(report.per_size)
+    return report
+
+
+# ---------------------------------------------------------------------------
+# JNI overhead: empty-call cost measured with a second tiny .so
+# ---------------------------------------------------------------------------
+
+_NOOP_JAVA = """\
+public class KpNoop {
+    static { System.loadLibrary("kpnoop"); }
+    public static native void kpNoop();
+    public static void main(String[] args) throws Exception {
+        int iters = Integer.parseInt(args[0]);
+        for (int w = 0; w < 200000; w++) kpNoop(); // warmup
+        long t0 = System.nanoTime();
+        for (int i = 0; i < iters; i++) kpNoop();
+        long t1 = System.nanoTime();
+        System.out.println("OK " + (t1 - t0));
+    }
+}
+"""
+
+_NOOP_CPP = """\
+#include <jni.h>
+extern "C" {
+JNIEXPORT void JNICALL Java_KpNoop_kpNoop(JNIEnv*, jclass) {}
+} // extern "C"
+"""
+
+
+def _measure_jni_overhead(
+    env: BuiltEnv,
+    iters: int = 1_000_000,
+    repeats: int = 3,
+    timeout: float = 120.0,
+) -> float | None:
+    """Median nanoseconds per *empty* JNI call.
+
+    Built at bench time WITHOUT touching jni.py: a minimal extra JNI
+    source (one empty native method ``kpNoop``) is generated in the work
+    dir, compiled to a second .so (``libkpnoop.so``), loaded from a tiny
+    Java driver, and timed in a ``System.nanoTime`` loop. Returns None --
+    letting the bench continue -- when anything fails.
+    """
+    try:
+        work = Path(env.work)
+        (work / "KpNoop.java").write_text(_NOOP_JAVA, encoding="utf-8")
+        (work / "kpnoop.cpp").write_text(_NOOP_CPP, encoding="utf-8")
+        compile_java([work / "KpNoop.java"], env.classes)
+        compile_jni(work / "kpnoop.cpp", work / "libkpnoop.so")
+        java = _which_or_raise("java")
+        per_call: list[float] = []
+        for _ in range(repeats):
+            r = subprocess.run(
+                [
+                    java,
+                    f"-Djava.library.path={work}",
+                    "-cp",
+                    str(env.classes),
+                    "KpNoop",
+                    str(iters),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            out = r.stdout.strip()
+            if r.returncode != 0 or not out.startswith("OK "):
+                return None
+            per_call.append(int(out[3:]) / iters)
+        return statistics.median(per_call)
+    except Exception:
+        return None
+
 
 def run_bench(
     env: BuiltEnv,
@@ -711,48 +1344,66 @@ def run_bench(
     repeats: int = 5,
     seed: int = 1234,
     timeout: float = 300.0,
+    sizes: list[int] | None = None,
+    rigorous: bool = False,
+    overhead: bool = True,
 ) -> BenchReport:
-    args = gen_bench_args(env.method, seed=seed)
+    """Wall-clock benchmark: Java original vs JNI translation.
+
+    New in v0.2 (all optional; defaults keep v0.1 behavior):
+
+    - ``sizes``: when given, the bench is repeated at each array length
+      (``array_len`` is passed through to :func:`gen_bench_args`) and the
+      per-size medians recorded in ``report.per_size`` as
+      ``{size, java_ns, jni_ns, speedup}``; ``report.break_even_size`` is
+      the smallest size beating the 1.2x heuristic bar, else None.
+    - ``rigorous``: detect JMH / Google Benchmark. When neither is present
+      (the usual case) an *honest* enhanced wall-clock is used instead:
+      IQR outlier trimming plus a 95% CI half-width, with
+      ``report.rigorous_note`` saying exactly what ran. Framework results
+      are never faked (see :func:`_apply_rigorous`).
+    - ``overhead``: measure the empty-JNI-call cost into
+      ``report.jni_overhead_ns`` (second tiny .so built at bench time);
+      None when the noop build fails, and the bench continues.
+    """
     s_java, s_jni = open_sessions(env)
-    j_ns: list[int] = []
-    n_ns: list[int] = []
     try:
-        # sanity: the representative input must be valid for the Java original
-        probe = s_java.ask(encode_call(env.method, args), timeout)
-        if probe.startswith("ERR"):
-            raise RuntimeError(
-                f"generated benchmark input is invalid for the Java original: {probe}. "
-                "This is a v0.1 input-heuristic limitation."
-            )
-        if not probe.startswith("OK "):
-            raise RuntimeError(f"protocol error: {probe!r}")
-        bench_line = f"BENCH {iters} " + " ".join(
-            encode_arg(p.jtype, v) for p, v in zip(env.method.params, args)
+        args = gen_bench_args(env.method, seed=seed)
+        j_ns, n_ns = _bench_samples(
+            s_java, s_jni, env.method, args, iters, warmup, repeats, timeout
         )
-        warm_line = f"BENCH {warmup} " + " ".join(
-            encode_arg(p.jtype, v) for p, v in zip(env.method.params, args)
-        )
-        for rep in range(repeats):
-            for sess, store in ((s_java, j_ns), (s_jni, n_ns)):
-                r = sess.ask(warm_line, timeout)  # warmup, discarded
-                if r.startswith("ERR"):
-                    raise RuntimeError(f"harness error during warmup: {r}")
-                r = sess.ask(bench_line, timeout)
-                if r.startswith("ERR"):
-                    raise RuntimeError(f"harness error during bench: {r}")
-                if not r.startswith("OK "):
-                    raise RuntimeError(f"protocol error: {r!r}")
-                store.append(int(r[3:]))
+        size_samples: list[tuple[int, list[int], list[int]]] = []
+        if sizes:
+            # NOTE: for matMul-shaped methods (a size-like scalar parameter)
+            # the array length comes from gen_case's sqrt heuristic, so
+            # `size` is only an approximate knob there; for plain array
+            # kernels it is exact.
+            for size in sorted(set(sizes)):
+                s_args = gen_bench_args(env.method, seed=seed, array_len=size)
+                try:
+                    sj, sn = _bench_samples(
+                        s_java, s_jni, env.method, s_args,
+                        iters, warmup, repeats, timeout,
+                    )
+                except RuntimeError:
+                    continue  # invalid input at this size; skip it
+                size_samples.append((size, sj, sn))
     finally:
         s_java.close()
         s_jni.close()
-    return BenchReport(
+    overhead_ns = _measure_jni_overhead(env) if overhead else None
+    report = BenchReport(
         method=env.method.qualname,
         iters=iters,
         warmup=warmup,
         java_nanos=j_ns,
         jni_nanos=n_ns,
+        jni_overhead_ns=overhead_ns,
+        per_size=[_size_entry(size, sj, sn, iters) for size, sj, sn in size_samples],
     )
+    if rigorous:
+        report = _apply_rigorous(report, size_samples)
+    return report
 
 
 def fmt_ns(ns: float) -> str:

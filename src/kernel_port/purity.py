@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from . import java_ast as J
 from .java_ast import (
     MethodInfo,
     children,
@@ -55,10 +56,24 @@ _PURE_RECEIVERS = {"Math": _PURE_MATH, "StrictMath": _PURE_MATH}
 class _PurityWalk:
     """Walk one method body, collecting impurity reasons."""
 
-    def __init__(self, method: MethodInfo, src: bytes, checker: "_PurityChecker"):
+    def __init__(
+        self,
+        method: MethodInfo,
+        src: bytes,
+        checker: "_PurityChecker",
+        final_fields: frozenset = frozenset(),
+        in_constructor: bool = False,
+    ):
         self.method = method
         self.src = src
         self.checker = checker
+        # Class context for class-level portability checks: names of final
+        # *instance* fields of the enclosing class. Reads of those fields are
+        # pure (a final field never changes after construction); writes are
+        # pure only inside a constructor. Empty by default, so plain
+        # per-method checks behave exactly as before.
+        self.final_fields = final_fields
+        self.in_constructor = in_constructor
         self.reasons: list[str] = []
         self.locals: set[str] = set()  # params + declared local names
         for p in method.params:
@@ -140,7 +155,7 @@ class _PurityWalk:
         # 2. repo-local calls (bare, this., or ClassName.)
         target = self._resolve_call(name, receiver)
         if target is not None:
-            sub = self.checker.check(target)
+            sub = self.checker.check_callee(target, self)
             if not sub.pure:
                 self._impure(
                     f"calls impure method '{target.qualname}': {sub.reasons[0]}"
@@ -159,6 +174,26 @@ class _PurityWalk:
         dotted = f"{recv_text}.{name}" if recv_text else name
         self._impure(f"calls {dotted}(...) (not provably pure)")
 
+    def _final_read_ok(self, receiver) -> bool:
+        """True when a read of a final instance field provably targets this class.
+
+        A bare ``x`` / ``this.x`` is always this class's field. ``other.x``
+        is only accepted when ``other`` is a parameter whose declared type is
+        this class (e.g. ``Point other``); anything else stays conservative.
+        """
+        if receiver is None:
+            return True
+        if receiver.type == "this":
+            return True
+        if receiver.type == "identifier":
+            rtext = self._t(receiver)
+            for p in self.method.params:
+                if p.name == rtext:
+                    own = self.method.class_qualname.rsplit(".", 1)[-1]
+                    return p.jtype.rsplit(".", 1)[-1] == own
+            return False
+        return False
+
     def _check_field_access(self, node, *, is_write: bool) -> None:
         kids = named(node)
         if not kids:
@@ -172,6 +207,18 @@ class _PurityWalk:
         # Foo.class literal: pure
         if fname == "class":
             return
+        # final instance fields of the class under analysis: reads are pure
+        # (the field cannot change after construction); writes are pure only
+        # inside a constructor. Falls through to the conservative path when
+        # the receiver provably isn't this class.
+        if fname in self.final_fields:
+            if not is_write and self._final_read_ok(receiver):
+                return
+            if is_write and self.in_constructor and self._final_read_ok(receiver):
+                return
+            if is_write:
+                self._impure(f"writes to final field '{fname}' outside a constructor")
+                return
         if receiver is None or receiver.type == "this" or (
             receiver.type == "identifier" and self._t(receiver) not in self.locals
         ):
@@ -220,7 +267,13 @@ class _PurityWalk:
                 elif lhs.type == "identifier":
                     lname = self._t(lhs)
                     if lname not in self.locals and self._field_of(lname) is not None:
-                        if not self._is_constant_field(lname):
+                        if lname in self.final_fields:
+                            # bare `x = ...` targets this.x: pure only in a ctor
+                            if not self.in_constructor:
+                                self._impure(
+                                    f"writes to final field '{lname}' outside a constructor"
+                                )
+                        elif not self._is_constant_field(lname):
                             self._impure(f"writes to mutable field '{lname}'")
                         else:
                             self._impure(f"writes to constant field '{lname}'")
@@ -239,7 +292,14 @@ class _PurityWalk:
                 elif operand.type == "identifier":
                     oname = self._t(operand)
                     if oname not in self.locals and self._field_of(oname) is not None:
-                        self._impure(f"mutates field '{oname}'")
+                        if oname in self.final_fields and self.in_constructor:
+                            pass  # `x++` on a final field inside a ctor: pure
+                        elif oname in self.final_fields:
+                            self._impure(
+                                f"writes to final field '{oname}' outside a constructor"
+                            )
+                        else:
+                            self._impure(f"mutates field '{oname}'")
                 else:
                     self.walk(operand)
             return
@@ -288,6 +348,8 @@ class _PurityWalk:
         if t == "identifier":
             name = self._t(node)
             if name not in self.locals and self._field_of(name) is not None:
+                if name in self.final_fields:
+                    return  # bare read of a final instance field: pure
                 if not self._is_constant_field(name):
                     self._impure(f"reads mutable field '{name}'")
             return
@@ -301,6 +363,10 @@ class _PurityChecker:
     def __init__(self, repo):
         self.repo = repo
         self._cache: dict[str, PurityReport] = {}
+        # separate cache for class-context checks (final-field allowances);
+        # keyed (qualname, in_constructor) so plain-check results are never
+        # contaminated by class-context results or vice versa.
+        self._class_cache: dict[tuple[str, bool], PurityReport] = {}
         self._in_progress: set[str] = set()
         self.pure_callees_seen: list[str] = []
         # simple class name -> qualname (first wins; ambiguity -> None)
@@ -348,6 +414,59 @@ class _PurityChecker:
         raw = path.read_bytes()
         return raw.decode("utf-8", errors="replace").encode("utf-8")
 
+    def check_callee(self, target: MethodInfo, walk: "_PurityWalk") -> PurityReport:
+        """Check a call target, inheriting the caller's class context.
+
+        When the caller is being checked with a final-field context and the
+        target is a method of the same class, the target is checked with the
+        same context (its reads of final fields are pure). Otherwise this is
+        exactly ``check(target)``.
+        """
+        if walk.final_fields and target.class_qualname == walk.method.class_qualname:
+            return self.check_in_class(target, walk.final_fields, in_constructor=False)
+        return self.check(target)
+
+    def check_in_class(
+        self,
+        method: MethodInfo,
+        final_fields: frozenset,
+        in_constructor: bool = False,
+    ) -> PurityReport:
+        """Purity check with class context: final instance fields are readable
+        (and writable inside constructors). Used by class-level portability."""
+        key = (method.qualname, in_constructor)
+        if key in self._class_cache:
+            return self._class_cache[key]
+        if method.qualname in self._in_progress:
+            # Recursive edge: coinductively assume pure, as in check().
+            return PurityReport(pure=True)
+        if method.body is None:
+            rep = PurityReport(
+                pure=False, reasons=["method has no body (abstract or native)"]
+            )
+            self._class_cache[key] = rep
+            return rep
+        self._in_progress.add(method.qualname)
+        try:
+            src = self._source_of(method)
+            walk = _PurityWalk(
+                method,
+                src,
+                self,
+                final_fields=final_fields,
+                in_constructor=in_constructor,
+            )
+            walk.walk(method.body)
+            rep = PurityReport(
+                pure=not walk.reasons,
+                reasons=walk.reasons,
+                pure_callees=list(self.pure_callees_seen),
+            )
+        finally:
+            self._in_progress.discard(method.qualname)
+        self._class_cache[key] = rep
+        return rep
+
 
 def check_purity(method: MethodInfo, repo) -> PurityReport:
     """Public entry: purity report for one method."""
@@ -362,3 +481,174 @@ def check_purity_repo(repo) -> dict[str, PurityReport]:
         for m in overloads:
             out[m.qualname] = checker.check(m)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Class-level portability (workstream C2)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ClassPurityReport:
+    portable: bool
+    kind: str  # "stateless" | "immutable" | "rejected"
+    reasons: list[str] = field(default_factory=list)
+    method_reports: dict[str, PurityReport] = field(default_factory=dict)
+
+
+def _instance_field_writes(
+    cls: J.ClassInfo, method: MethodInfo, src: bytes
+) -> list[str]:
+    """Names of instance fields written by `method` (conservative).
+
+    Covers ``this.x = ...``, bare ``x = ...`` (resolving to an instance
+    field), and ``x++``/``x--``. Any ambiguous write counts as a write:
+    a false negative (rejecting the class) is acceptable, a false positive
+    is not.
+    """
+    if method.body is None:
+        return []
+    instance = {f.name for f in cls.fields.values() if "static" not in f.modifiers}
+    if not instance:
+        return []
+    locals_: set[str] = {p.name for p in method.params}
+    written: list[str] = []
+
+    def note(name: str) -> None:
+        if name in instance and name not in written:
+            written.append(name)
+
+    def declare(node) -> None:
+        nm = child(node, "identifier")
+        if nm is not None:
+            locals_.add(text(nm, src))
+
+    def visit(node) -> None:
+        t = node.type
+        if t == "local_variable_declaration":
+            for decl in children(node, "variable_declarator"):
+                declare(decl)
+            for c in named(node):
+                visit(c)
+            return
+        if t == "enhanced_for_statement":
+            declare(node)
+            for c in named(node):
+                if c.type != "identifier":
+                    visit(c)
+            return
+        if t == "catch_clause":
+            for c in named(node):
+                if c.type == "catch_formal_parameter":
+                    declare(c)
+                else:
+                    visit(c)
+            return
+        if t == "assignment_expression":
+            kids = named(node)
+            if kids:
+                lhs = kids[0]
+                if lhs.type == "field_access":
+                    ks = named(lhs)
+                    if ks:
+                        note(text(ks[-1], src))
+                elif lhs.type == "identifier":
+                    nm = text(lhs, src)
+                    if nm not in locals_:
+                        note(nm)
+                else:
+                    visit(lhs)
+                for c in kids[1:]:
+                    visit(c)
+            return
+        if t == "update_expression":
+            operand = next((c for c in named(node)), None)
+            if operand is not None:
+                if operand.type == "field_access":
+                    ks = named(operand)
+                    if ks:
+                        note(text(ks[-1], src))
+                elif operand.type == "identifier":
+                    nm = text(operand, src)
+                    if nm not in locals_:
+                        note(nm)
+                else:
+                    visit(operand)
+            return
+        for c in named(node):
+            visit(c)
+
+    visit(method.body)
+    return written
+
+
+def check_class_portable(cls: J.ClassInfo, repo) -> ClassPurityReport:
+    """Decide whether a whole class is portable as a unit.
+
+    - *stateless*: no instance fields, no explicit constructors, every method
+      static (``static final`` constants allowed), every method pure.
+    - *immutable*: every instance field is ``final``, no method writes an
+      instance field outside a constructor, every method pure (constructors
+      may assign final fields).
+    - otherwise *rejected*, with concrete reasons.
+    """
+    method_reports: dict[str, PurityReport] = {}
+    reasons: list[str] = []
+    checker = _PurityChecker(repo)
+
+    instance_fields = [f for f in cls.fields.values() if "static" not in f.modifiers]
+    static_fields = [f for f in cls.fields.values() if "static" in f.modifiers]
+    final_instance = frozenset(
+        f.name for f in instance_fields if "final" in f.modifiers
+    )
+    nonfinal_instance = [f.name for f in instance_fields if "final" not in f.modifiers]
+    mutable_statics = [f.name for f in static_fields if "final" not in f.modifiers]
+    simple = cls.name
+
+    # 1. every method (constructors included) must be pure, with class context:
+    #    reads of final instance fields are pure; constructors may assign them.
+    for m in cls.all_methods:
+        rep = checker.check_in_class(m, final_instance, in_constructor=m.is_constructor)
+        method_reports[m.qualname] = rep
+        if not rep.pure:
+            first = rep.reasons[0] if rep.reasons else "unknown reason"
+            reasons.append(f"method '{m.qualname}' is impure: {first}")
+
+    # 2. structural rules
+    for fname in mutable_statics:
+        reasons.append(f"mutable static field '{fname}'")
+
+    constructors = [m for m in cls.all_methods if m.is_constructor]
+    non_ctor = [m for m in cls.all_methods if not m.is_constructor]
+
+    kind = "rejected"
+    if not instance_fields:
+        if constructors:
+            reasons.append(
+                f"has {len(constructors)} explicit constructor(s) but no instance state"
+            )
+        elif all(m.is_static for m in non_ctor):
+            kind = "stateless"
+        else:
+            inst = sorted(m.name for m in non_ctor if not m.is_static)
+            reasons.append(f"has instance methods {inst} but no instance fields")
+    else:
+        for fname in nonfinal_instance:
+            reasons.append(f"instance field '{fname}' is not final")
+        writes_found = False
+        for m in non_ctor:
+            src = checker._source_of(m)
+            for fname in _instance_field_writes(cls, m, src):
+                writes_found = True
+                reasons.append(
+                    f"mutable field '{fname}' written in '{simple}.{m.name}()'"
+                )
+        if not nonfinal_instance and not writes_found:
+            kind = "immutable"
+
+    portable = kind in ("stateless", "immutable") and not reasons
+    if not portable:
+        kind = "rejected"
+    return ClassPurityReport(
+        portable=portable, kind=kind, reasons=reasons, method_reports=method_reports
+    )

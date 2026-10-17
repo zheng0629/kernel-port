@@ -48,6 +48,25 @@ def test_e2e_verify_fib_passes(repo, tmp_path):
     assert report.all_passed, [c.detail for c in report.cases if not c.ok]
 
 
+def test_e2e_verify_matmul_passes(repo, tmp_path):
+    # void method: the harness echoes mutated arrays, so this is a real check
+    env = _build(repo, "com.example.Kernels.matMul", tmp_path)
+    report = H.run_verify(env, cases=10, seed=7)
+    assert report.all_passed, [c.detail for c in report.cases if not c.ok]
+    assert report.passed == 10
+
+
+def test_e2e_verify_detects_wrong_void_translation(repo, tmp_path):
+    # Regression: void-method translations used to be unverifiable ("OK v").
+    env = _build(
+        repo, "com.example.Kernels.matMul", tmp_path,
+        translation_key="com.example.Kernels.matMul_WRONG",
+    )
+    report = H.run_verify(env, cases=10, seed=7)
+    assert not report.all_passed
+    assert report.failed > 0
+
+
 def test_e2e_bench_smoke(repo, tmp_path):
     env = _build(repo, "com.example.Kernels.dot", tmp_path)
     report = H.run_bench(env, iters=200, warmup=50, repeats=2)

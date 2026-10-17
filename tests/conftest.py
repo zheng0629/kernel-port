@@ -21,6 +21,21 @@ TRANSLATIONS = {
     "com.example.Kernels.dot_WRONG": """    double s = 0.0;
     for (int i = 0; i < p_a_len; i++) s += p_a[i] * p_b[i];
     return s + 1.0;""",
+    "com.example.Kernels.matMul": """    for (int i = 0; i < p_n; i++) {
+        for (int j = 0; j < p_n; j++) {
+            double s = 0.0;
+            for (int k = 0; k < p_n; k++) s += p_a[i * p_n + k] * p_b[k * p_n + j];
+            const_cast<double*>(p_c)[i * p_n + j] = s;
+        }
+    }""",
+    # Deliberately wrong void translation: output array perturbed.
+    "com.example.Kernels.matMul_WRONG": """    for (int i = 0; i < p_n; i++) {
+        for (int j = 0; j < p_n; j++) {
+            double s = 0.0;
+            for (int k = 0; k < p_n; k++) s += p_a[i * p_n + k] * p_b[k * p_n + j];
+            const_cast<double*>(p_c)[i * p_n + j] = s + 1.0;
+        }
+    }""",
 }
 
 

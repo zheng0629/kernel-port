@@ -26,8 +26,21 @@ def test_glue_generates_three_files(repo, tmp_path):
 
 
 def test_glue_java_declares_native(repo, tmp_path):
+    # v0.3 default: dispatcher with fallback switch (USE_NATIVE).
     m = _method(repo, "com.example.Kernels.sieve")
     files = jni.generate(m, tmp_path / "glue")
+    src = files["java"].read_text()
+    assert 'System.getProperty("kernelport.native"' in src
+    assert "setUseNative" in src
+    assert "com.example.Kernels.sieve" in src  # fallback delegates to original
+    assert "private static native int[] sieveNative(int n);" in src
+    assert 'System.loadLibrary("kernels")' in src
+
+
+def test_glue_no_fallback_is_plain_native(repo, tmp_path):
+    # fallback=False restores the v0.1 plain native declaration.
+    m = _method(repo, "com.example.Kernels.sieve")
+    files = jni.generate(m, tmp_path / "glue", fallback=False)
     src = files["java"].read_text()
     assert "public static native int[] sieve(int n);" in src
     assert 'System.loadLibrary("kernels")' in src

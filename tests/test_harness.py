@@ -84,6 +84,24 @@ def test_results_equal_void(repo):
     assert ok
 
 
+def test_results_equal_void_array_echo(repo):
+    m = _method(repo, "com.example.Kernels.matMul")
+    ok, _ = H.results_equal(m, "v|ad:1.0,2.0|ad:3.0|ai:1", "v|ad:1.0,2.0|ad:3.0|ai:1")
+    assert ok
+    # float tolerance applies to the echoed arrays
+    ok, _ = H.results_equal(m, "v|ad:1.0", "v|ad:1.0000000001")
+    assert ok
+    ok, detail = H.results_equal(m, "v|ad:1.0,2.0", "v|ad:1.0,2.001")
+    assert not ok and "mismatch" in detail
+    # shape mismatches fail loudly
+    ok, _ = H.results_equal(m, "v|ad:1.0", "v")
+    assert not ok
+    ok, _ = H.results_equal(m, "v|ad:1.0", "v|ad:1.0|ad:2.0")
+    assert not ok
+    ok, _ = H.results_equal(m, "v|ai:1,2", "v|ai:1,3")
+    assert not ok
+
+
 def test_harness_render_compiles_standalone(tmp_path, repo):
     """The generated harness must be syntactically valid Java."""
     from kernel_port.harness import compile_java, render_harness

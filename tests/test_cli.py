@@ -22,9 +22,10 @@ def test_cli_mine_json():
     r = runner.invoke(app, ["mine", str(FIXTURE_REPO), "--format", "json"])
     assert r.exit_code == 0, r.output
     data = json.loads(r.output)
-    by_name = {c["method"]: c for c in data}
+    by_name = {c["method"]: c for c in data["methods"]}
     assert by_name["com.example.Kernels.dot"]["pure"] is True
     assert by_name["com.example.Kernels.noisy"]["pure"] is False
+    assert "clusters" in data and "classes" in data
 
 
 def test_cli_extract_text():

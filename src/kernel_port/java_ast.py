@@ -144,6 +144,17 @@ class ClassInfo:
     methods: dict[str, MethodInfo] = field(default_factory=dict)  # name -> (first) method
     all_methods: list[MethodInfo] = field(default_factory=list)
     fields: dict[str, FieldInfo] = field(default_factory=dict)
+    kind: str = "class"  # "class" | "interface" | "enum" | "record" | "annotation"
+
+
+# tree-sitter node type -> ClassInfo.kind
+_KIND_BY_NODE = {
+    "class_declaration": "class",
+    "interface_declaration": "interface",
+    "enum_declaration": "enum",
+    "record_declaration": "record",
+    "annotation_type_declaration": "annotation",
+}
 
 
 @dataclass
@@ -245,13 +256,59 @@ def _parse_field(node, src: bytes, class_qualname: str, rel: str) -> list[FieldI
     return out
 
 
+def _parse_constructor(node, src: bytes, class_qualname: str, rel: str) -> MethodInfo:
+    """Parse a constructor_declaration into a MethodInfo (is_constructor=True)."""
+    name = text(child(node, "identifier"), src)
+    mods = _modifiers(node, src)
+    params: list[Param] = []
+    fp = child(node, "formal_parameters")
+    if fp is not None:
+        for p in children(fp, "formal_parameter"):
+            pname_node = child(p, "identifier")
+            ptype_node = next(
+                (c for c in named(p) if c.type in _TYPE_NODES), None
+            )
+            if pname_node is None or ptype_node is None:
+                continue
+            params.append(
+                Param(
+                    name=text(pname_node, src),
+                    jtype=type_text(ptype_node, src),
+                )
+            )
+    body = child(node, "block", "constructor_body")
+    qualname = f"{class_qualname}.{name}"
+    return MethodInfo(
+        qualname=qualname,
+        class_qualname=class_qualname,
+        name=name,
+        jtype="void",
+        params=params,
+        modifiers=mods,
+        is_static=False,
+        is_constructor=True,
+        file=rel,
+        lineno=node.start_point[0] + 1,
+        end_lineno=node.end_point[0] + 1,
+        source=text(node, src),
+        body=body,
+        node=node,
+    )
+
+
 def _parse_class(node, src: bytes, package: str, rel: str, repo: "JavaRepo") -> None:
     name_node = child(node, "identifier")
     if name_node is None:
         return
     name = text(name_node, src)
     qualname = f"{package}.{name}" if package else name
-    cls = ClassInfo(qualname=qualname, package=package, name=name, file=rel)
+    cls = ClassInfo(
+        qualname=qualname,
+        package=package,
+        name=name,
+        file=rel,
+        kind=_KIND_BY_NODE.get(node.type, "class"),
+    )
     repo.classes[qualname] = cls
     body = child(
         node,
@@ -266,6 +323,11 @@ def _parse_class(node, src: bytes, package: str, rel: str, repo: "JavaRepo") -> 
         t = member.type
         if t == "method_declaration":
             m = _parse_method(member, src, qualname, rel)
+            cls.all_methods.append(m)
+            cls.methods.setdefault(m.name, m)
+            repo.methods.setdefault((qualname, m.name), []).append(m)
+        elif t == "constructor_declaration":
+            m = _parse_constructor(member, src, qualname, rel)
             cls.all_methods.append(m)
             cls.methods.setdefault(m.name, m)
             repo.methods.setdefault((qualname, m.name), []).append(m)
