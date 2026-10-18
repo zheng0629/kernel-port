@@ -1,5 +1,7 @@
 # kernel-port
 
+[中文](README.zh-CN.md) | **English**
+
 **Mine pure-compute "kernels" from a Java repo, and port them to C++ via JNI — with proof.**
 
 `kernel-port` is an **agent-callable toolchain** for cross-language performance porting. It does not call an LLM itself. Instead, it handles every *deterministic* step around the translation, so a coding agent (like Muse) can run the whole pipeline:

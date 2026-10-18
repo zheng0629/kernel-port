@@ -1,5 +1,7 @@
 # kernel-port
 
+[English](README.md) | **中文**
+
 **从 Java 仓库中挖掘纯计算"算子"，转成 C++ 经 JNI 调用——全程可验证。**
 
 `kernel-port` 是一套 **agent 可调用的工具链**，做跨语言性能移植。它自己不调 LLM，而是把翻译之外的*确定性*环节全部包办，让 coding agent（如 Muse）跑通整条流水线：
