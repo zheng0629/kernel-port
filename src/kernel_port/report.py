@@ -26,8 +26,9 @@ Input schema
                         "score": float, "pure": bool}],
         "verify": {"passed": int, "failed": int, "skipped": int,
                    "boundary_passed": int, "boundary_failed": int},
-        "bench": {"java_per_call_ns": float, "jni_per_call_ns": float,
+        "bench": {"backend": str, "java_per_call_ns": float, "jni_per_call_ns": float,
                   "speedup": float, "jni_overhead_ns": float | None,
+                  "rust_overhead_ns": float | None,
                   "per_size": [{"size": int, "speedup": float}]},
         "winner": str | None,
         "verdict": str,                    # free text, e.g. "worth porting: 1.88x faster"
@@ -246,7 +247,9 @@ def _speedup_svg(per_size) -> str:
     for i, (size, speedup) in enumerate(points):
         x = pad_l + i * slot + (slot - bar_w) / 2
         bh = max(2.0, speedup / vmax * plot_h)
-        color = "#10b981" if speedup >= 1.0 else "#ef4444"
+        from .harness import verdict_for_speedup as _vfs
+        _v = _vfs(speedup)
+        color = {"faster": "#10b981", "slower": "#ef4444"}.get(_v, "#3b82f6")
         parts.append(
             '<rect x="{0:.1f}" y="{1:.1f}" width="{2:.1f}" height="{3:.1f}" '
             'rx="3" fill="{4}"/>'.format(x, base_y - bh, bar_w, bh, color)
@@ -273,6 +276,11 @@ def _bench_panel(bench) -> str:
     jni_ns = bench.get("jni_per_call_ns")
     speedup = bench.get("speedup")
     overhead = bench.get("jni_overhead_ns")
+    if overhead is None:
+        overhead = bench.get("rust_overhead_ns")
+    native_short = {"jni": "JNI", "ffm": "FFM", "rust": "Rust"}.get(
+        bench.get("backend"), "JNI"
+    )
     svg = _bench_svg(java_ns, jni_ns)
     sp_svg = _speedup_svg(bench.get("per_size"))
     stats = (
@@ -280,12 +288,13 @@ def _bench_panel(bench) -> str:
         "<li>Java: <b>{}</b> ns/call</li>"
         "<li>JNI: <b>{}</b> ns/call</li>"
         "<li>Speedup: <b>{}x</b></li>"
-        "<li>JNI overhead: <b>{}</b> ns</li>"
+        "<li>{} overhead: <b>{}</b> ns</li>"
         "</ul>"
     ).format(
         _num(java_ns, "{:,.1f}"),
         _num(jni_ns, "{:,.1f}"),
         _num(speedup),
+        native_short,
         _num(overhead, "{:,.1f}"),
     )
     sp_section = (
@@ -311,7 +320,9 @@ def _verdict_banner(report) -> str:
         sp = float(speedup) if speedup is not None else None
     except (TypeError, ValueError):
         sp = None
-    if "not worth porting" in low:
+    if "inconclusive" in low:
+        cls, prefix = "verdict-warn", "Inconclusive"
+    elif "not worth porting" in low:
         cls, prefix = "verdict-bad", "Not worth porting"
     elif "worth porting" in low or (sp is not None and sp > 1.0):
         cls, prefix = "verdict-good", "Worth porting"
@@ -382,10 +393,12 @@ svg .svg-grid{stroke:#475569;stroke-width:1}
 gap:14px;align-items:flex-start}
 .verdict-good{background:rgba(16,185,129,.14);border:1px solid var(--green)}
 .verdict-bad{background:rgba(245,158,11,.12);border:1px solid var(--yellow)}
+.verdict-warn{background:rgba(96,165,250,.12);border:1px solid var(--blue)}
 .verdict-tag{flex:none;font-weight:700;text-transform:uppercase;font-size:.85rem;
 letter-spacing:.04em;padding:2px 10px;border-radius:6px}
 .verdict-good .verdict-tag{background:var(--green);color:#052e1b}
 .verdict-bad .verdict-tag{background:var(--yellow);color:#451a03}
+.verdict-warn .verdict-tag{background:var(--blue);color:#eff6ff}
 .verdict p{margin:0}
 footer{margin-top:28px;padding-top:14px;border-top:1px solid var(--card);
 color:var(--muted);font-size:.8rem;text-align:center}

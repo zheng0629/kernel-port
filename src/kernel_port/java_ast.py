@@ -26,6 +26,79 @@ def parser() -> Parser:
     return _PARSER
 
 
+# File-bytes cache: miner/purity/extractor re-read the same file once per
+# method (v0.8 dogfood: 11,541 reads for 121 JOML files). Entries are keyed
+# by absolute path and validated by mtime+size, so edited files are never
+# served stale.
+_source_bytes_cache: dict[str, tuple[int, int, bytes]] = {}
+
+
+def source_bytes(root: Path | str, rel: str) -> bytes:
+    """Repo file bytes, utf-8 normalized, cached by path+mtime+size.
+
+    Centralizes the ``read_bytes()`` + ``decode(errors="replace")`` dance
+    previously copy-pasted across miner/purity/extractor/jni. Raises
+    ``OSError`` when the file cannot be read (callers that tolerate missing
+    files catch it themselves).
+    """
+    p = Path(root) / rel
+    key = str(p.absolute())
+    st = p.stat()
+    entry = _source_bytes_cache.get(key)
+    if (
+        entry is not None
+        and entry[0] == st.st_mtime_ns
+        and entry[1] == st.st_size
+    ):
+        return entry[2]
+    src = p.read_bytes().decode("utf-8", errors="replace").encode("utf-8")
+    _source_bytes_cache[key] = (st.st_mtime_ns, st.st_size, src)
+    return src
+
+
+_TEST_DIR_NAMES = frozenset({"test", "tests"})
+
+# Directory names that mark example/benchmark sources rather than shippable
+# library code (v0.12 dogfood: commons-numbers' examples-jmh module
+# contributed 370 of 880 mined methods, including a top-5 candidate).
+# Matched exactly, or as a hyphen-separated suffix ("-examples",
+# "-samples", "-jmh", ...), so Maven module dirs like
+# "commons-numbers-examples" are skipped while a "com.example" package
+# directory is NOT (its path part is exactly "example").
+_EXAMPLE_DIR_NAMES = frozenset(
+    {
+        "examples",
+        "examples-jmh",
+        "samples",
+        "demos",
+        "jmh",
+        "benchmark",
+        "benchmarks",
+    }
+)
+_EXAMPLE_DIR_SUFFIXES = ("-examples", "-example", "-samples", "-jmh", "-benchmarks", "-benchmark")
+
+
+def _is_example_dir(part: str) -> bool:
+    low = part.lower()
+    return low in _EXAMPLE_DIR_NAMES or low.endswith(_EXAMPLE_DIR_SUFFIXES)
+
+
+def is_skipped_source(rel: str) -> bool:
+    """True for files that are never port candidates.
+
+    Test sources (v0.8 dogfood: JOML's ``src/test`` utilities were ranked
+    as kernels) and example/benchmark sources (v0.12 dogfood:
+    commons-numbers' ``examples-jmh`` JMH harnesses dominated the
+    ranking). Both :func:`scan_repo` and the parse-cache scan loop honor
+    this.
+    """
+    parts = Path(rel).parts
+    return any(part in _TEST_DIR_NAMES for part in parts) or any(
+        _is_example_dir(part) for part in parts
+    )
+
+
 def text(node, src: bytes) -> str:
     return src[node.start_byte : node.end_byte].decode("utf-8", errors="replace")
 
@@ -81,7 +154,9 @@ def type_text(type_node, src: bytes) -> str:
         )
         base = type_text(inner, src) if inner is not None else "?"
         dims = sum(
-            1 for c in type_node.children if c.type == "dimensions"
+            text(c, src).count("[")
+            for c in type_node.children
+            if c.type == "dimensions"
         ) or text(type_node, src).count("[")
         return base + "[]" * dims
     if t in ("integral_type", "floating_point_type", "boolean_type", "void_type"):
@@ -145,6 +220,7 @@ class ClassInfo:
     all_methods: list[MethodInfo] = field(default_factory=list)
     fields: dict[str, FieldInfo] = field(default_factory=dict)
     kind: str = "class"  # "class" | "interface" | "enum" | "record" | "annotation"
+    modifiers: set[str] = field(default_factory=set)  # v0.12: class-level modifiers (public/abstract/...)
 
 
 # tree-sitter node type -> ClassInfo.kind
@@ -308,6 +384,7 @@ def _parse_class(node, src: bytes, package: str, rel: str, repo: "JavaRepo") -> 
         name=name,
         file=rel,
         kind=_KIND_BY_NODE.get(node.type, "class"),
+        modifiers=_modifiers(node, src),
     )
     repo.classes[qualname] = cls
     body = child(
@@ -319,7 +396,8 @@ def _parse_class(node, src: bytes, package: str, rel: str, repo: "JavaRepo") -> 
     )
     if body is None:
         return
-    for member in named(body):
+
+    def handle(member) -> None:
         t = member.type
         if t == "method_declaration":
             m = _parse_method(member, src, qualname, rel)
@@ -343,6 +421,16 @@ def _parse_class(node, src: bytes, package: str, rel: str, repo: "JavaRepo") -> 
             # nested classes: recurse with dotted qualname
             _parse_class(member, src, qualname, rel, repo)
 
+    for member in named(body):
+        # v0.8 dogfood: tree-sitter nests enum methods/fields one level
+        # deeper, under enum_body_declarations -- without this, enum
+        # static methods were invisible to mine/extract entirely.
+        if member.type == "enum_body_declarations":
+            for sub in named(member):
+                handle(sub)
+        else:
+            handle(member)
+
 
 def scan_repo(root: Path | str, subdir: str | None = None) -> JavaRepo:
     """Parse every .java file under root (or root/subdir)."""
@@ -354,8 +442,9 @@ def scan_repo(root: Path | str, subdir: str | None = None) -> JavaRepo:
     java_files = sorted(base.rglob("*.java"))
     for path in java_files:
         rel = path.relative_to(root).as_posix()
-        raw = path.read_bytes()
-        src = raw.decode("utf-8", errors="replace").encode("utf-8")
+        if is_skipped_source(rel):
+            continue  # test/example sources are never port candidates
+        src = source_bytes(root, rel)
         tree = parser().parse(src)
         root_node = tree.root_node
         package = ""

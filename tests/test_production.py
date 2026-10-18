@@ -20,7 +20,8 @@ def _bad_method():
         qualname="p.T.m",
         class_qualname="p.T",
         name="m",
-        jtype="String",
+        # v0.4 supports double[][]/int[][]/String; float[][] stays unsupported
+        jtype="float[][]",
         params=[],
         modifiers={"static"},
         is_static=True,
@@ -100,7 +101,7 @@ def test_two_arg_generate_matches_fallback_true_default(repo, tmp_path):
 
 
 def test_fallback_rejects_unsupported_type(tmp_path):
-    with pytest.raises(ValueError, match="unsupported type 'String'"):
+    with pytest.raises(ValueError, match=r"unsupported type 'float\[\]\[\]'"):
         jni.generate(_bad_method(), tmp_path, fallback=True)
 
 

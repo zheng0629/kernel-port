@@ -4,13 +4,30 @@ A method is *pure* when its body provably has no observable side effects and
 its result depends only on its arguments:
 
 - no I/O, network, or framework calls (only an allowlist of known-pure JDK
-  calls such as ``Math.*`` / ``StrictMath.*``, never ``Math.random()``)
+  calls such as ``Math.*`` / ``StrictMath.*``, plus allowlisted pure ``String``
+  instance methods like ``length()`` / ``charAt()`` / ``substring()`` on
+  String-typed values, never ``Math.random()``)
 - no object allocation except array creation (``new int[n]`` is fine,
   ``new Random()`` is not)
 - no reads/writes of mutable state: only ``static final`` constants may be
   read; any field write is impure
-- no ``synchronized``, ``throw``, lambdas, method references,
-  try-with-resources, or ``super`` calls
+- no ``synchronized``, lambdas, method references, try-with-resources, or
+  ``super`` calls
+- ``throw`` is allowed only in the *deterministic-throw* form:
+  ``throw new <UncheckedType>(args...)`` where ``<UncheckedType>`` is one of
+  ``IllegalArgumentException``, ``IllegalStateException``,
+  ``ArithmeticException``, ``NullPointerException``,
+  ``IndexOutOfBoundsException``, ``ArrayIndexOutOfBoundsException``,
+  ``StringIndexOutOfBoundsException``, ``UnsupportedOperationException``,
+  ``RuntimeException``, ``AssertionError`` (simple or qualified name), and
+  every argument is a pure expression (constants, locals/params, pure
+  arithmetic or string concatenation -- unknown method calls in the args
+  are impure, as everywhere else). Still rejected: ``throw someField;``
+  (a pre-built object may capture mutable state),
+  ``throw new Exception(...)`` / ``throw new IOException(...)`` (checked
+  exceptions are out of scope), rethrow of a caught variable
+  (``catch (E e) { ... throw e; }`` -- unknown provenance), and any throw
+  whose argument expression is impure.
 - calls to other repo methods are allowed only when the callee is itself
   pure (computed coinductively, so direct recursion is fine)
 
@@ -52,6 +69,46 @@ _PURE_MATH = frozenset(
 )
 _PURE_RECEIVERS = {"Math": _PURE_MATH, "StrictMath": _PURE_MATH}
 
+# Provably-pure, deterministic String instance methods. Instance calls on a
+# String-typed value (param, local, or a chain like s.trim().toLowerCase())
+# are pure, which lets real String kernels (hashing, parsing) be mined.
+# Deliberately EXCLUDED:
+# - getBytes: charset-dependent (uses the platform default charset)
+# - split: regex semantics; kept conservative for now (regex compilation and
+#   edge-case behavior differ across ports)
+# - replaceAll / replaceFirst / matches: regex-based, same as split
+# - intern: touches the global string pool (observable side effect)
+# - formatted / format: locale-sensitive
+# Note: toLowerCase/toUpperCase are allowlisted in their no-arg form, which
+# uses the default locale -- deterministic for a given run, matching the
+# same-locale differential testing the verify step performs.
+_PURE_STRING_METHODS = frozenset(
+    "length isEmpty isBlank charAt codePointAt codePointBefore codePointCount "
+    "equals equalsIgnoreCase compareTo compareToIgnoreCase hashCode "
+    "indexOf lastIndexOf startsWith endsWith contains "
+    "substring subSequence toLowerCase toUpperCase trim strip stripLeading "
+    "stripTrailing concat replace toCharArray toString".split()
+)
+
+# Unchecked exception types whose construction is deterministic and
+# side-effect-free, so `throw new <T>(pure args...)` stays pure. Checked
+# exceptions (Exception, IOException, ...) are deliberately excluded: they
+# belong to a different portability story and are rejected with a reason.
+_DETERMINISTIC_THROW_TYPES = frozenset(
+    {
+        "IllegalArgumentException",
+        "IllegalStateException",
+        "ArithmeticException",
+        "NullPointerException",
+        "IndexOutOfBoundsException",
+        "ArrayIndexOutOfBoundsException",
+        "StringIndexOutOfBoundsException",
+        "UnsupportedOperationException",
+        "RuntimeException",
+        "AssertionError",
+    }
+)
+
 
 class _PurityWalk:
     """Walk one method body, collecting impurity reasons."""
@@ -76,8 +133,16 @@ class _PurityWalk:
         self.in_constructor = in_constructor
         self.reasons: list[str] = []
         self.locals: set[str] = set()  # params + declared local names
+        # declared simple type of params/locals, for String-receiver checks.
+        # Reassignment never changes the declared type, so this is only ever
+        # added to, never updated or removed.
+        self.local_types: dict[str, str] = {}
         for p in method.params:
             self.locals.add(p.name)
+            if self._declared_string_type(p.jtype):
+                self.local_types[p.name] = "String"
+        # names bound by catch formal parameters, for rethrow detection
+        self.caught_exceptions: set[str] = set()
 
     # -- helpers --------------------------------------------------------
 
@@ -122,6 +187,56 @@ class _PurityWalk:
             return None
         return None
 
+    def _declared_string_type(self, jtype: str | None) -> bool:
+        """True when a declared type text provably means java.lang.String.
+
+        Bare ``String`` counts only when the repo does not define its own
+        class named ``String`` (which would shadow java.lang.String); a
+        fully-qualified ``java.lang.String`` always counts.
+        """
+        if not jtype:
+            return False
+        if jtype == "java.lang.String":
+            return True
+        return (
+            jtype == "String"
+            and self.checker.class_by_simple_name("String") is None
+        )
+
+    def _string_typed(self, node) -> bool:
+        """True when the expression provably has type java.lang.String.
+
+        Covers identifiers with a String declared type (params and locals)
+        and chains of allowlisted String calls (``s.trim().toLowerCase()``:
+        the result of an allowlisted call on a String-typed receiver is
+        itself a String). Everything else is conservatively False.
+        """
+        t = node.type
+        if t == "identifier":
+            return self.local_types.get(self._t(node)) == "String"
+        if t == "method_invocation":
+            kids = named(node)
+            arg_list = child(node, "argument_list")
+            name_node, receiver = None, None
+            if arg_list is not None and arg_list in kids:
+                idx = kids.index(arg_list)
+                for j in range(idx - 1, -1, -1):
+                    if kids[j].type == "identifier":
+                        name_node = kids[j]
+                        receiver = kids[j - 1] if j > 0 else None
+                        break
+            if (
+                name_node is not None
+                and self._t(name_node) in _PURE_STRING_METHODS
+                and receiver is not None
+            ):
+                return self._string_typed(receiver)
+            return False
+        if t == "parenthesized_expression":
+            inner = next((c for c in named(node)), None)
+            return inner is not None and self._string_typed(inner)
+        return False
+
     def _check_invocation(self, node) -> None:
         kids = named(node)
         arg_list = child(node, "argument_list")
@@ -151,6 +266,30 @@ class _PurityWalk:
                     return
                 self._impure(f"calls {recv_text}.{name}(...) (not a pure JDK call)")
                 return
+
+        # 1b. allowlisted pure String instance methods: s.length(), s.charAt(i)
+        #     on a String-typed receiver (params, locals, or a chain like
+        #     s.trim().toLowerCase()). Argument expressions must be pure, as
+        #     with Math.*.
+        if (
+            receiver is not None
+            and name in _PURE_STRING_METHODS
+            and self._string_typed(receiver)
+        ):
+            for c in kids:
+                if c is not name_node:
+                    self.walk(c)
+            return
+
+        # 1c. String-typed receiver but a non-allowlisted method (getBytes,
+        #     split, intern, ...): conservatively impure, with a message that
+        #     names the allowlist so users know why.
+        if receiver is not None and self._string_typed(receiver):
+            self._impure(
+                f"calls {recv_text}.{name}(...) "
+                f"(String method '{name}' not on the pure-method allowlist)"
+            )
+            return
 
         # 2. repo-local calls (bare, this., or ClassName.)
         target = self._resolve_call(name, receiver)
@@ -233,6 +372,80 @@ class _PurityWalk:
         if not is_write:
             self._impure(f"reads field '{fname}' of an object")
 
+    def _pure_expression_reasons(self, expr) -> list[str]:
+        """Impurity reasons for one expression, via a scratch walk.
+
+        Reuses the checker's existing pure-expression logic (literals,
+        locals/params, pure arithmetic and string concatenation, allowlisted
+        ``Math.*`` calls; unknown method calls are impure). The scratch walk
+        inherits this walk's locals and final-field context, so anything the
+        method itself may read is allowed here too. Conservative: any reason
+        means the expression is impure.
+        """
+        sub = _PurityWalk(
+            self.method,
+            self.src,
+            self.checker,
+            final_fields=self.final_fields,
+            in_constructor=self.in_constructor,
+        )
+        sub.locals = set(self.locals)
+        sub.local_types = dict(self.local_types)
+        sub.caught_exceptions = set(self.caught_exceptions)
+        sub.walk(expr)
+        return sub.reasons
+
+    def _check_throw(self, node) -> None:
+        """Decide whether a throw statement is purity-compatible.
+
+        Accepted: ``throw new <UncheckedType>(pure args...)`` with the type
+        on the allowlist. Everything else is rejected with a stated reason:
+        throwing a pre-built object (may capture mutable state), a checked
+        exception type, a rethrow of a caught variable (unknown provenance),
+        or a throw whose argument expression is impure.
+        """
+        expr = next((c for c in named(node)), None)
+        if expr is None:
+            self._impure("throw with no expression")
+            return
+        if expr.type != "object_creation_expression":
+            ename = self._t(expr)
+            if expr.type == "identifier" and ename in self.caught_exceptions:
+                self._impure(
+                    f"rethrows caught exception '{ename}' (unknown provenance)"
+                )
+            elif expr.type == "identifier":
+                self._impure(
+                    f"throws a pre-built exception object '{ename}' "
+                    "(may capture mutable state)"
+                )
+            else:
+                self._impure(
+                    f"throws a non-deterministic exception expression '{ename}'"
+                )
+            return
+        # throw new Type(args...)
+        tn = next(
+            (c for c in named(expr) if c.type not in ("argument_list",)),
+            None,
+        )
+        tname = self._t(tn) if tn is not None else "?"
+        simple = tname.rsplit(".", 1)[-1]
+        if simple not in _DETERMINISTIC_THROW_TYPES:
+            self._impure(
+                f"throws exception of type '{tname}' "
+                "(only deterministic unchecked types are allowed)"
+            )
+            return
+        arg_list = child(expr, "argument_list")
+        if arg_list is not None:
+            for arg in named(arg_list):
+                bad = self._pure_expression_reasons(arg)
+                if bad:
+                    self._impure(
+                        f"throw argument '{self._t(arg)}' is impure: {bad[0]}"
+                    )
+
     # -- main walk ------------------------------------------------------
 
     def walk(self, node) -> None:
@@ -307,7 +520,7 @@ class _PurityWalk:
             self._impure("uses synchronized")
             return
         if t == "throw_statement":
-            self._impure("throws an exception")
+            self._check_throw(node)
             return
         if t == "lambda_expression":
             self._impure("uses a lambda")
@@ -320,10 +533,25 @@ class _PurityWalk:
             self._impure("uses try-with-resources")
             return
         if t == "local_variable_declaration":
+            # First type-like named child is the declared type (a `modifiers`
+            # node may precede it, e.g. `final String x`).
+            tnode = next(
+                (
+                    c
+                    for c in named(node)
+                    if c.type in ("type_identifier", "scoped_type_identifier")
+                    or c.type.endswith("_type")
+                ),
+                None,
+            )
+            ttext = self._t(tnode) if tnode is not None else ""
             for decl in children(node, "variable_declarator"):
                 nm = child(decl, "identifier")
                 if nm is not None:
-                    self.locals.add(self._t(nm))
+                    lname = self._t(nm)
+                    self.locals.add(lname)
+                    if self._declared_string_type(ttext):
+                        self.local_types[lname] = "String"
                 for c in named(decl):
                     if c.type != "identifier":
                         self.walk(c)
@@ -331,7 +559,17 @@ class _PurityWalk:
         if t == "enhanced_for_statement":
             nm = child(node, "identifier")
             if nm is not None:
-                self.locals.add(self._t(nm))
+                lname = self._t(nm)
+                self.locals.add(lname)
+                # Declared type is the named child right before the loop var.
+                kn = named(node)
+                ttext = ""
+                if nm in kn:
+                    idx = kn.index(nm)
+                    if idx > 0:
+                        ttext = self._t(kn[idx - 1])
+                if self._declared_string_type(ttext):
+                    self.local_types[lname] = "String"
             for c in named(node):
                 if c is not nm:
                     self.walk(c)
@@ -341,7 +579,9 @@ class _PurityWalk:
                 if c.type == "catch_formal_parameter":
                     nm = child(c, "identifier")
                     if nm is not None:
-                        self.locals.add(self._t(nm))
+                        pname = self._t(nm)
+                        self.locals.add(pname)
+                        self.caught_exceptions.add(pname)
                 else:
                     self.walk(c)
             return
@@ -410,9 +650,7 @@ class _PurityChecker:
         return rep
 
     def _source_of(self, method: MethodInfo) -> bytes:
-        path = self.repo.root / method.file
-        raw = path.read_bytes()
-        return raw.decode("utf-8", errors="replace").encode("utf-8")
+        return J.source_bytes(self.repo.root, method.file)
 
     def check_callee(self, target: MethodInfo, walk: "_PurityWalk") -> PurityReport:
         """Check a call target, inheriting the caller's class context.

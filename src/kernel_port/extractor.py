@@ -15,7 +15,9 @@ for programmatic agent consumption.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from . import java_ast as J
 from .purity import ClassPurityReport, PurityReport, _PurityChecker, check_class_portable
@@ -27,6 +29,7 @@ class ClosureMember:
     qualname: str
     source: str
     signature: str = ""
+    class_qualname: str = ""  # owning class, for minimal-source synthesis
 
 
 @dataclass
@@ -40,8 +43,7 @@ def _called_repo_methods(method: J.MethodInfo, repo: J.JavaRepo) -> list[J.Metho
     """Direct repo-method callees of `method` (same resolution as purity)."""
     if method.body is None:
         return []
-    raw = (repo.root / method.file).read_bytes()
-    src = raw.decode("utf-8", errors="replace").encode("utf-8")
+    src = J.source_bytes(repo.root, method.file)
     checker = _PurityChecker(repo)  # reuse simple-name resolution
     found: list[J.MethodInfo] = []
 
@@ -92,8 +94,7 @@ def _read_constants(method: J.MethodInfo, repo: J.JavaRepo) -> list[J.FieldInfo]
     """static final constants read by `method` (transitively via closure)."""
     if method.body is None:
         return []
-    raw = (repo.root / method.file).read_bytes()
-    src = raw.decode("utf-8", errors="replace").encode("utf-8")
+    src = J.source_bytes(repo.root, method.file)
     cls = repo.classes.get(method.class_qualname)
     if cls is None:
         return []
@@ -121,17 +122,54 @@ def _read_constants(method: J.MethodInfo, repo: J.JavaRepo) -> list[J.FieldInfo]
 
 
 def extract(repo: J.JavaRepo, qualname: str) -> Extraction:
-    """Extract a kernel and its dependency closure."""
-    method = repo.find_method(qualname)
-    if method is None:
-        overloads = repo.overloads(qualname)
-        if overloads:
-            raise ValueError(
-                f"'{qualname}' is overloaded ({len(overloads)} variants); "
-                "v0.1 requires a unique method name"
-            )
-        raise ValueError(f"method not found: {qualname}")
+    """Extract a kernel and its dependency closure.
+
+    ``qualname`` accepts the v0.4 overload suffix, e.g.
+    ``com.example.K.foo(int,double)`` (see :mod:`overloading`).
+    """
+    from . import overloading
+
+    try:
+        method = overloading.parse_method_ref(repo, qualname)
+    except (overloading.AmbiguityError, LookupError) as exc:
+        raise ValueError(str(exc)) from exc
     return _extract_method(repo, method)
+
+
+def _extract_closure(repo: J.JavaRepo, method: J.MethodInfo) -> list[ClosureMember]:
+    """Dependency closure of `method`: called helpers (transitively) and the
+    ``static final`` constants it reads. No purity check -- callers that need
+    the verdict use :func:`_extract_method`."""
+    closure: list[ClosureMember] = []
+    seen: set[str] = {method.qualname}
+    stack = _called_repo_methods(method, repo)
+    while stack:
+        callee = stack.pop(0)
+        if callee.qualname in seen:
+            continue
+        seen.add(callee.qualname)
+        closure.append(
+            ClosureMember(
+                kind="method",
+                qualname=callee.qualname,
+                source=callee.source,
+                signature=callee.signature,
+                class_qualname=callee.class_qualname,
+            )
+        )
+        stack.extend(_called_repo_methods(callee, repo))
+
+    for const in _read_constants(method, repo):
+        closure.append(
+            ClosureMember(
+                kind="constant",
+                qualname=const.qualname,
+                source=const.source,
+                signature=f"{const.jtype} {const.name}",
+                class_qualname=const.qualname.rsplit(".", 1)[0],
+            )
+        )
+    return closure
 
 
 def _extract_method(
@@ -147,39 +185,297 @@ def _extract_method(
     if purity is None:
         purity = checker.check(method)
 
-    closure: list[ClosureMember] = []
-    seen: set[str] = {method.qualname}
-    stack = _called_repo_methods(method, repo)
-    while stack:
-        callee = stack.pop(0)
-        if callee.qualname in seen:
-            continue
-        seen.add(callee.qualname)
-        closure.append(
-            ClosureMember(
-                kind="method",
-                qualname=callee.qualname,
-                source=callee.source,
-                signature=callee.signature,
-            )
-        )
-        stack.extend(_called_repo_methods(callee, repo))
-
-    for const in _read_constants(method, repo):
-        closure.append(
-            ClosureMember(
-                kind="constant",
-                qualname=const.qualname,
-                source=const.source,
-                signature=f"{const.jtype} {const.name}",
-            )
-        )
+    closure = _extract_closure(repo, method)
     return Extraction(method=method, purity=purity, closure=closure)
 
 
-def render_text(ext: Extraction) -> str:
-    """Human/agent-readable prompt material."""
+def _file_imports(repo: J.JavaRepo, rel: str) -> list[str]:
+    """Import declaration texts from a repo file (best effort)."""
+    try:
+        src = J.source_bytes(repo.root, rel)
+    except OSError:
+        return []
+    try:
+        tree = J.parser().parse(src)
+    except Exception:
+        return []
+    return [
+        J.text(top, src)
+        for top in J.named(tree.root_node)
+        if top.type == "import_declaration"
+    ]
+
+
+def _file_package(repo: J.JavaRepo, rel: str) -> str:
+    """The file's own package (authoritative).
+
+    Nested classes inherit the file's package, but ``ClassInfo.package``
+    stores the outer qualname for them (``_parse_class`` recursion), so the
+    file itself is the reliable source here.
+    """
+    try:
+        src = J.source_bytes(repo.root, rel)
+    except OSError:
+        return ""
+    try:
+        tree = J.parser().parse(src)
+    except Exception:
+        return ""
+    for top in J.named(tree.root_node):
+        if top.type == "package_declaration":
+            p = J.child(top, "scoped_identifier", "identifier")
+            if p is not None:
+                return J.text(p, src).replace(" ", "")
+    return ""
+
+
+def _needed_imports(imports: list[str], member_sources: list[str]) -> list[str]:
+    """Keep only imports actually referenced by the synthesized members.
+
+    A kernel file may import annotation-only deps (jspecify, intellij) used
+    solely by *other* methods; carrying them into the minimal file would
+    reintroduce the uncompilable-dependency problem this synthesis exists
+    to avoid.
+    """
+    body = "\n".join(member_sources)
+    kept = []
+    for imp in imports:
+        simple = imp.rstrip(";").split(".")[-1].strip()
+        if simple == "*":
+            # Wildcard: keep only java.* (always resolvable from the JDK).
+            if re.match(r"import\s+(static\s+)?java\.", imp):
+                kept.append(imp)
+            continue
+        if re.search(r"\b" + re.escape(simple) + r"\b", body):
+            kept.append(imp)
+    return kept
+
+
+def _widen_visibility(source: str) -> str:
+    """Rewrite ``private``/``protected`` member modifiers to ``public``.
+
+    Only the declaration header is touched: scanning stops at the first
+    ``{`` at parenthesis depth 0 (the body or initializer start), or at
+    the end of the source when there is none. String and char literals
+    are left alone, so a ``"private"`` inside an annotation argument or
+    initializer is never rewritten.
+    """
+    n = len(source)
+    # 1. Find the end of the declaration header.
+    depth = 0
+    in_str: str | None = None
+    esc = False
+    end = n
+    i = 0
+    while i < n:
+        ch = source[i]
+        if in_str is not None:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == in_str:
+                in_str = None
+        elif ch in "\"'":
+            in_str = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif ch == "{" and depth == 0:
+            end = i
+            break
+        i += 1
+    # 2. Rewrite modifiers in the header, skipping string/char literals.
+    header = source[:end]
+    out: list[str] = []
+    i = 0
+    in_str = None
+    esc = False
+    while i < end:
+        ch = header[i]
+        if in_str is not None:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch in "\"'":
+            in_str = ch
+            out.append(ch)
+            i += 1
+            continue
+        m = re.match(r"(?:private|protected)\b", header[i:])
+        if m:
+            out.append("public")
+            i += m.end()
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out) + source[end:]
+
+
+def render_minimal_sources(
+    method: J.MethodInfo, closure: list[ClosureMember], repo: J.JavaRepo
+) -> dict[str, str] | None:
+    """Render minimal compilable Java sources for the kernel + its closure.
+
+    Returns ``{repo-relative-path: source}`` -- one synthetic container class
+    per distinct owning class -- or ``None`` when synthesis is not safe, in
+    which case callers fall back to compiling the original file.
+
+    Rationale (v0.8 dogfood): ``javac`` typechecks the *whole* original file,
+    so compiling it drags in environmentally-broken siblings (test sources,
+    annotation-only deps, ``jdk.internal`` users). The synthesized file holds
+    exactly the extracted kernel, so the harness differentially tests the
+    same code the agent was asked to translate.
+
+    Bail-outs (return ``None``): non-``class``/``interface`` kinds,
+    constants without initializers (would not compile standalone),
+    unresolvable class info.
+    """
+    # Group members by owning class, kernel first.
+    groups: dict[str, list[tuple[str, str]]] = {}
+    order: list[str] = []
+
+    def add(class_qn: str, kind: str, source: str) -> None:
+        if class_qn not in groups:
+            groups[class_qn] = []
+            order.append(class_qn)
+        groups[class_qn].append((kind, source))
+
+    add(method.class_qualname, "method", method.source)
+    for c in closure:
+        if c.kind == "constant" and "=" not in c.source:
+            # e.g. initialized in a static block -- cannot synthesize safely
+            return None
+        add(c.class_qualname, c.kind, c.source)
+
+    out: dict[str, str] = {}
+    for class_qn in order:
+        cls = repo.classes.get(class_qn)
+        if cls is None or cls.kind not in ("class", "interface"):
+            return None
+        pkg = _file_package(repo, cls.file)
+        if pkg and class_qn.startswith(pkg + "."):
+            nesting = class_qn[len(pkg) + 1 :].split(".")
+        elif not pkg and "." not in class_qn:
+            nesting = [class_qn]  # default package
+        else:
+            return None  # cannot determine nesting safely: use repo file
+        if not nesting or any(not n.isidentifier() for n in nesting):
+            return None
+        members = groups[class_qn]
+        imports = _needed_imports(
+            _file_imports(repo, cls.file), [s for _, s in members]
+        )
+        lines: list[str] = []
+        if pkg:
+            lines.append(f"package {pkg};")
+        lines.extend(imports)
+        if lines:
+            lines.append("")
+        kw = "interface" if cls.kind == "interface" else "class"
+        for i, name in enumerate(nesting):
+            ind = "    " * i
+            if i == 0:
+                lines.append(f"{ind}public {kw} {name} {{")
+            else:
+                lines.append(f"{ind}public static class {name} {{")
+        ind = "    " * len(nesting)
+        for _kind, src in members:
+            # v0.12 dogfood: the harness calls the kernel from another
+            # package, so private/protected members must be widened in the
+            # synthesized test-only copy (the class wrapper above is already
+            # public). Widening is behavior-preserving for differential
+            # testing: accessibility never changes dispatch or semantics.
+            src = _widen_visibility(src)
+            for ln in src.splitlines():
+                lines.append(ind + ln if ln.strip() else "")
+            lines.append("")
+        for i in reversed(range(len(nesting))):
+            lines.append("    " * i + "}")
+        rel = (
+            "/".join(pkg.split(".")) + "/" + nesting[0] + ".java"
+            if pkg
+            else nesting[0] + ".java"
+        )
+        out[rel] = "\n".join(lines)
+    return out
+
+
+def _type_mapping_notes(m: J.MethodInfo) -> list[str]:
+    """Native-signature notes for 2-D array / String types (v0.4).
+
+    Tells the translating LLM exactly what C++ signature the generated JNI
+    glue presents, so the hand-written body targets the right contract.
+    Empty for methods using only v0.1 types.
+    """
+    notes = []
+    for p in m.params:
+        if p.jtype in ("double[][]", "int[][]"):
+            elem = "double" if p.jtype == "double[][]" else "int32_t"
+            notes.append(
+                f"- param {p.name}: {p.jtype} arrives flattened row-major as "
+                f"`const {elem}* p_{p.name}` with `int p_{p.name}_rows, "
+                f"p_{p.name}_cols` (the Java glue flattens before the native "
+                f"call; one JNI array pin, rectangular arrays only)."
+            )
+        elif p.jtype == "String":
+            notes.append(
+                f"- param {p.name}: String arrives as `const char* p_{p.name}` "
+                f"via GetStringUTFChars (Modified UTF-8: NUL -> 0xC0 0x80, "
+                f"non-BMP chars -> CESU-8 surrogate pairs; byte-oriented "
+                f"logic matches Java semantics on ASCII input)."
+            )
+    if m.jtype in ("double[][]", "int[][]"):
+        elem = "double" if m.jtype == "double[][]" else "int32_t"
+        notes.append(
+            f"- return {m.jtype}: return the data as a flat row-major "
+            f"`std::vector<{elem}>` and set `*p_out_rows` / `*p_out_cols` to "
+            f"the result dimensions; the JNI wrapper rebuilds the 2-D array."
+        )
+    elif m.jtype == "String":
+        notes.append(
+            "- return String: return a `std::string`; the glue wraps it with "
+            "NewStringUTF."
+        )
+    return notes
+
+
+_BACKEND_NOTES = {
+    "jni": (
+        "- Target language: C++17. Keep the exact signature semantics.",
+        "- Only the method body (and closure bodies) need translation;",
+        "  kernel-port generates the JNI glue separately (`kernel-port glue`).",
+    ),
+    "ffm": (
+        "- Target language: C (plain C ABI, no JNI wrapper). Keep the exact signature semantics.",
+        "- Only the function body (and closure bodies) need translation;",
+        "  kernel-port generates the Panama FFM glue separately (`kernel-port glue --backend ffm`).",
+        "- Use the parameter names from the generated skeleton (e.g. p_<name>, p_<name>_len).",
+    ),
+    "rust": (
+        "- Target language: Rust. Keep the exact signature semantics.",
+        "- Only the function body (and closure bodies) need translation;",
+        "  kernel-port generates the Rust glue separately (`kernel-port glue --backend rust`).",
+        "- Slices are passed as &[T] (read-only) or &mut [T] (written); no length params.",
+    ),
+}
+
+
+def render_text(ext: Extraction, backend: str = "jni") -> str:
+    """Human/agent-readable prompt material.
+
+    ``backend`` selects the translation-notes block (v0.9 dogfood: the notes
+    always said C++17/JNI even when the agent was targeting FFM or Rust).
+    """
     m = ext.method
+    notes = _BACKEND_NOTES.get(backend, _BACKEND_NOTES["jni"])
     lines = [
         "# kernel-port extraction",
         "",
@@ -210,12 +506,13 @@ def render_text(ext: Extraction) -> str:
     lines += [
         "",
         "## Translation notes for the LLM",
-        "- Target language: C++17. Keep the exact signature semantics.",
-        "- Only the method body (and closure bodies) need translation;",
-        "  kernel-port generates the JNI glue separately (`kernel-port glue`).",
+        *notes,
         "- Preserve floating-point operation order; do not introduce",
         "  reassociation unless the differential test still passes.",
     ]
+    type_notes = _type_mapping_notes(m)
+    if type_notes:
+        lines += ["", "### Type mapping for the native signature"] + type_notes
     return "\n".join(lines)
 
 

@@ -22,14 +22,14 @@ DOT_BODY = TRANSLATIONS["com.example.Kernels.dot"]
 DOT_WRONG = TRANSLATIONS["com.example.Kernels.dot_WRONG"]
 
 
-def _run(tmp_path, **kwargs):
+def _run(tmp_path, repo=None, **kwargs):
     glue_out = tmp_path / "glue"
     work_dir = tmp_path / "work"
     cache_dir = tmp_path / "cache"
     kwargs.setdefault("glue_out", glue_out)
     kwargs.setdefault("work_dir", work_dir)
     kwargs.setdefault("cache_dir", cache_dir)
-    return P.run_pipeline(FIXTURE_REPO, **kwargs)
+    return P.run_pipeline(FIXTURE_REPO if repo is None else repo, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +41,7 @@ def test_awaiting_translation(tmp_path):
     rep = _run(tmp_path, method="com.example.Kernels.dot")
     assert rep["status"] == "awaiting_translation"
     assert rep["method"] == "com.example.Kernels.dot"
+    assert rep["backend"] == "jni"  # default backend is recorded in the report
     assert rep["purity"] == {"pure": True, "reasons": []}
     assert rep["verify"] is None and rep["bench"] is None
     assert rep["cache_hit"] is False
@@ -240,3 +241,107 @@ def test_awaiting_translation_without_companions(tmp_path, blocked_companions):
     rep = _run(tmp_path, method="com.example.Kernels.dot")
     assert rep["status"] == "awaiting_translation"
     assert rep["purity"]["pure"] is True
+
+
+# ---------------------------------------------------------------------------
+# (e) ffm backend
+# ---------------------------------------------------------------------------
+
+FFM_REPO = Path(__file__).parent / "fixtures" / "ffm_kernels"
+# Hand-written C translation for com.example.FfmKernels.dot, standing in for
+# the calling agent's LLM step. FFM C ABI: arrays arrive as
+# (const T* p_x, int64_t p_x_len).
+FFM_DOT_BODY = (
+    "    double s = 0.0;\n"
+    "    for (int64_t i = 0; i < p_a_len; i++) s += p_a[i] * p_b[i];\n"
+    "    return s;"
+)
+
+
+def test_ffm_backend_awaiting_translation(tmp_path):
+    rep = _run(tmp_path, method="com.example.Kernels.dot", backend="ffm")
+    assert rep["status"] == "awaiting_translation"
+    assert rep["backend"] == "ffm"
+    glue_dir = Path(rep["glue_dir"])
+    assert (glue_dir / "kernels_ffm.c").exists()
+    ffm_java = list(glue_dir.glob("*Ffm.java"))
+    assert len(ffm_java) == 1
+    assert "BEGIN TRANSLATED BODY" in rep["instructions"]
+    assert str(glue_dir / "kernels_ffm.c") in rep["instructions"]
+    assert "The C translation is still missing" in rep["instructions"]
+    json.dumps(rep)
+
+
+def test_invalid_backend_returns_error(tmp_path):
+    rep = _run(tmp_path, method="com.example.Kernels.dot", backend="cuda")
+    assert rep["status"] == "error"
+    assert rep["backend"] == "cuda"
+    assert "'jni'" in rep["instructions"] and "'ffm'" in rep["instructions"]
+    json.dumps(rep)
+
+
+def test_full_run_ffm_success(tmp_path):
+    # Full e2e through the FFM backend (needs JDK >= 22 + cc).
+    rep = _full(
+        tmp_path,
+        method="com.example.FfmKernels.dot",
+        translated_body=FFM_DOT_BODY,
+        backend="ffm",
+        # point at the FFM fixture repo instead of the JNI one
+        repo=FFM_REPO,
+    )
+    assert rep["status"] == "success", rep.get("instructions")
+    assert rep["backend"] == "ffm"
+    assert rep["verify"]["passed"] > 0
+    assert rep["verify"]["failed"] == 0
+    # bench summary keeps the jni_* key names (see pipeline docstring), but
+    # for the ffm backend they describe the FFM path.
+    assert rep["bench"]["jni_per_call_ns"] > 0
+    assert rep["bench"]["speedup"] > 0
+    # v0.10: the verdict is honest about the measured speedup, whatever it is
+    # on this machine (in-band -> "inconclusive", never a claimed win).
+    assert "FFM native" in rep["instructions"]
+    assert "noise band" in rep["instructions"]
+    assert rep["bench"]["verdict"] in ("faster", "slower", "inconclusive")
+    json.dumps(rep)
+
+
+def test_mcp_pipeline_tool_passes_backend(monkeypatch):
+    from kernel_port import mcp_server as M
+
+    seen = {}
+
+    def fake_run_pipeline(*args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return {"status": "awaiting_translation"}
+
+    monkeypatch.setattr(M.pipeline_mod, "run_pipeline", fake_run_pipeline)
+    out = M.pipeline(repo="somewhere", backend="ffm")
+    assert out["status"] == "awaiting_translation"
+    assert seen["args"][0] == "somewhere"
+    assert seen["kwargs"]["backend"] == "ffm"
+    # default stays jni
+    M.pipeline(repo="somewhere")
+    assert seen["kwargs"]["backend"] == "jni"
+
+
+def test_pipeline_overload_suffix_resolves(tmp_path):
+    # v0.9 dogfood: pipeline passed m.qualname (bare) to extract, re-triggering
+    # AmbiguityError for overloaded methods. The original suffixed ref must be
+    # used so the chosen overload flows through.
+    from pathlib import Path as _P
+
+    overload_repo = str(_P(__file__).parent / "fixtures" / "overload_kernels")
+    rep = _run(
+        tmp_path,
+        repo=overload_repo,
+        method="com.example.Overloads.add(int,int)",
+    )
+    assert rep["status"] == "awaiting_translation", rep.get("instructions")
+    assert rep["method"] == "com.example.Overloads.add"
+    assert rep["purity"] == {"pure": True, "reasons": []}
+    # ...and the bare ambiguous name still errors with candidates listed.
+    rep2 = _run(tmp_path, repo=overload_repo, method="com.example.Overloads.add")
+    assert rep2["status"] == "error"
+    assert "Disambiguate" in rep2["instructions"]

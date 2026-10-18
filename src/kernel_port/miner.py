@@ -54,9 +54,7 @@ def _count_calls(repo: J.JavaRepo) -> dict[str, int]:
         for m in overloads:
             if m.body is None:
                 continue
-            path = repo.root / m.file
-            raw = path.read_bytes()
-            src = raw.decode("utf-8", errors="replace").encode("utf-8")
+            src = J.source_bytes(repo.root, m.file)
 
             def visit(node, _self_qn=m.qualname) -> None:
                 if node.type == "method_invocation":
@@ -106,8 +104,7 @@ def _count_calls(repo: J.JavaRepo) -> dict[str, int]:
 
 
 def _method_source(repo: J.JavaRepo, m: J.MethodInfo) -> bytes:
-    raw = (repo.root / m.file).read_bytes()
-    return raw.decode("utf-8", errors="replace").encode("utf-8")
+    return J.source_bytes(repo.root, m.file)
 
 
 def _intensity(m: J.MethodInfo, src: bytes) -> float:
@@ -221,8 +218,7 @@ def _ambiguous_callees(method: J.MethodInfo, repo: J.JavaRepo) -> list[tuple[str
     """
     if method.body is None:
         return []
-    raw = (repo.root / method.file).read_bytes()
-    src = raw.decode("utf-8", errors="replace").encode("utf-8")
+    src = J.source_bytes(repo.root, method.file)
     checker = _PurityChecker(repo)  # reuse simple-name resolution
     found: list[tuple[str, int]] = []
     seen_names: set[str] = set()
@@ -277,9 +273,7 @@ def _call_sites_to(repo: J.JavaRepo, target_qn: str, skip: set[str]) -> int:
         for m in overloads:
             if m.body is None or m.qualname in skip:
                 continue
-            path = repo.root / m.file
-            raw = path.read_bytes()
-            src = raw.decode("utf-8", errors="replace").encode("utf-8")
+            src = J.source_bytes(repo.root, m.file)
 
             def visit(node, _self_qn=m.qualname, _cls_qn=cls_qn) -> None:
                 nonlocal total

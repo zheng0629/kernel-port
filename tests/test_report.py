@@ -167,8 +167,20 @@ def test_per_size_chart_absent_without_data():
 def test_per_size_chart_present_with_data():
     out = render_html(full_report())
     assert "speedup vs input size" in out
-    # break-even reference line and sub-1x red bar for n=100 (0.92x)
     assert 'stroke-dasharray="5,4"' in out
+    # v0.10 noise band: 0.92x is inside the band -> blue (inconclusive),
+    # not red; clearly-outside points keep green/red.
+    assert 'fill="#3b82f6"' in out
+    assert 'fill="#10b981"' in out
+
+
+def test_per_size_chart_red_for_clearly_slower():
+    rep = full_report()
+    rep["bench"]["per_size"] = [
+        {"size": 100, "speedup": 0.5},
+        {"size": 1000, "speedup": 1.88},
+    ]
+    out = render_html(rep)
     assert 'fill="#ef4444"' in out
     assert 'fill="#10b981"' in out
 
@@ -206,3 +218,25 @@ def test_purity_impure_panel():
     assert "purity-red" in out
     assert "NOT PURE" in out
     assert "writes static field" in out
+
+
+def test_bench_panel_rust_overhead_label():
+    # workstream C: the HTML bench panel labels the overhead split with
+    # the backend that measured it.
+    out = render_html(
+        {
+            "title": "kernel-port bench report",
+            "method": "com.example.RustKernels.dot",
+            "status": "success",
+            "bench": {
+                "backend": "rust",
+                "java_per_call_ns": 1000.0,
+                "jni_per_call_ns": 1300.0,
+                "speedup": 0.77,
+                "rust_overhead_ns": 150.0,
+            },
+            "verdict": "not worth porting",
+        }
+    )
+    assert "Rust overhead" in out
+    assert "150.0" in out

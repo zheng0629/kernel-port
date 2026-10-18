@@ -49,3 +49,19 @@ def test_extract_json_shape(repo):
 def test_extract_unknown_method(repo):
     with pytest.raises(ValueError, match="not found"):
         extractor.extract(repo, "com.example.Kernels.nope")
+
+
+def test_render_text_backend_notes(repo):
+    # v0.9 dogfood: the translation notes always said C++17/JNI even when the
+    # agent was targeting FFM or Rust.
+    from kernel_port import extractor
+
+    ext = extractor.extract(repo, "com.example.Kernels.dot")
+    jni_text = extractor.render_text(ext)
+    assert "C++17" in jni_text and "JNI glue" in jni_text
+    ffm_text = extractor.render_text(ext, "ffm")
+    assert "plain C ABI" in ffm_text and "--backend ffm" in ffm_text
+    assert "C++17" not in ffm_text
+    rust_text = extractor.render_text(ext, "rust")
+    assert "Target language: Rust" in rust_text and "--backend rust" in rust_text
+    assert "C++17" not in rust_text

@@ -62,7 +62,44 @@ def _render_java(
     for p in plans:
         m = p.method
         java_params = ", ".join(f"{prm.jtype} {prm.name}" for prm in m.params)
-        lines.append(f"    public static native {m.jtype} {m.name}({java_params});")
+        if p.flat:
+            # v0.4: 2-D methods get a public wrapper (natural signature) over
+            # the private flat native, mirroring jni.render_java.
+            native_name = jni._flat_native_name(m)
+            flat_params = ", ".join(jni._flat_java_params(m))
+            lines.append(f"    public static {m.jtype} {m.name}({java_params}) {{")
+            lines.extend(jni._flat_wrapper_lines(p, native_name, "        "))
+            lines.append("    }")
+            lines.append(
+                f"    private static native {m.jtype} {native_name}({flat_params});"
+            )
+        else:
+            lines.append(f"    public static native {m.jtype} {m.name}({java_params});")
+    # flatten/unflattenInto helpers for the 2-D element types in use
+    need = {
+        prm.jtype
+        for p in plans if p.flat
+        for prm in p.method.params
+        if jni._classify(prm.jtype) == "array2d"
+    }
+    for jt in sorted(need):
+        elem = jni._2D_INFO[jt]["java_elem"]
+        lines += [
+            "",
+            f"    private static {elem}[] flatten({elem}[][] m) {{",
+            "        int rows = m.length, cols = rows > 0 ? m[0].length : 0;",
+            f"        {elem}[] f = new {elem}[rows * cols];",
+            "        for (int i = 0; i < rows; i++)",
+            "            System.arraycopy(m[i], 0, f, i * cols, cols);",
+            "        return f;",
+            "    }",
+            "",
+            f"    private static void unflattenInto({elem}[] f, {elem}[][] m) {{",
+            "        int rows = m.length, cols = rows > 0 ? m[0].length : 0;",
+            "        for (int i = 0; i < rows; i++)",
+            "            System.arraycopy(f, i * cols, m[i], 0, cols);",
+            "    }",
+        ]
     for s in skipped:
         lines.append(f"    // not gluable in v0.1: {s}")
     lines.append("}")
@@ -122,6 +159,21 @@ def generate_class(
         except ValueError as e:
             # same clear errors as single-method glue (unsupported types, ...)
             skipped.append(f"{m.qualname} ({e})")
+    # v0.12: overloaded native entry points need JNI long-form symbols.
+    # The JVM binds every same-named native declared in one class to a
+    # single short-form symbol -- with overloads present that is *silently
+    # wrong* dispatch (verified empirically: a 3-arg overload called the
+    # 2-arg body and returned a wrong result with no error). The long form
+    # (``__<mangled-signature>``) disambiguates by argument signature.
+    # (Single-method glue always declares exactly one native per class, so
+    # the short form stays correct there.)
+    by_func: dict[str, list] = {}
+    for p in plans:
+        by_func.setdefault(p.jni_func, []).append(p)
+    for func, dupes in by_func.items():
+        if len(dupes) > 1:
+            for p in dupes:
+                p.jni_func = func + jni.jni_long_suffix(p.method)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     native_class = plans[0].native_class if plans else cls.name + "Native"

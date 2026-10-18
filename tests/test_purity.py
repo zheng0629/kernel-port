@@ -95,7 +95,24 @@ def test_synchronized_rejected(tmp_path):
 
 
 def test_throw_rejected(tmp_path):
-    reasons = _check(tmp_path, '        if (x < 0) throw new IllegalArgumentException("neg");\n        return x;\n')
+    # v0.4: deterministic validation throws are purity-compatible now
+    # (do not use _check: it asserts impurity).
+    src = """package p;
+public class T {
+    static double m(double x) {
+        if (x < 0) throw new IllegalArgumentException("neg");
+        return x;
+    }
+}
+"""
+    repo = _repo_of_source(src, tmp_path)
+    rep = check_purity(_method(repo, "p.T.m"), repo)
+    assert rep.pure, rep.reasons
+
+
+def test_throw_prebuilt_rejected(tmp_path):
+    # Throwing a pre-built exception object may capture mutable state.
+    reasons = _check(tmp_path, "        if (x < 0) throw prebuilt;\n        return x;\n")
     assert any("throw" in r for r in reasons)
 
 

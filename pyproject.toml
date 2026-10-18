@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kernel-port"
-version = "0.3.0"
+version = "1.0.0"
 description = "Agent-callable toolchain: mine pure-compute kernels from Java repos, extract them with purity proofs, generate JNI glue, and verify + benchmark C++ translations."
 readme = "README.md"
 requires-python = ">=3.10"

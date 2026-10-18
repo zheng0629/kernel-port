@@ -6,3 +6,7 @@ __pycache__/
 .kp-work/
 build/
 dist/
+tests/cffi_work/
+
+.cargo-target/
+.kp-cargo-target/

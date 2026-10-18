@@ -8,6 +8,24 @@ from kernel_port import java_ast as J
 
 FIXTURE_REPO = Path(__file__).parent / "fixtures" / "sample_kernels"
 
+
+@pytest.fixture(autouse=True)
+def _isolated_kernel_cache(tmp_path, monkeypatch):
+    """Point the fingerprint cache's default dir at a fresh tmp dir.
+
+    Pipeline runs without an explicit ``cache_dir`` resolve to
+    ``kernel_port.cache.default_cache_dir()`` (``~/.cache/kernel-port``).
+    Without isolation, records written by one test would leak into other
+    tests (and into the developer's real cache), making results depend on
+    test order and on ambient state. Tests that pass an explicit
+    ``cache_dir`` are unaffected.
+    """
+    from kernel_port import cache
+
+    monkeypatch.setattr(
+        cache, "default_cache_dir", lambda: tmp_path / "kernel-port-cache"
+    )
+
 # Hand-written C++ translations, standing in for the calling agent's LLM step.
 TRANSLATIONS = {
     "com.example.Kernels.dot": """    double s = 0.0;

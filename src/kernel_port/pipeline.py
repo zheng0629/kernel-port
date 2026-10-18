@@ -25,12 +25,16 @@ is JSON-serializable)::
                                   # | verify_failed | cache_hit | error
         "method": str,            # qualified method name
         "signature": str,         # Java signature
+        "backend": str,           # "jni" | "ffm" -- the glue/verify/bench backend
         "purity": {"pure": bool, "reasons": [str]},
         "cache_hit": bool,
         "fingerprint": str | None,
         "verify": {"passed": int, "failed": int, "skipped": int} | None,
         "bench": {"java_per_call_ns": float,
-                  "jni_per_call_ns": float,
+                  "jni_per_call_ns": float,  # for backend="ffm" this value
+                                             # describes the FFM path, not JNI;
+                                             # the key name is kept so report.py
+                                             # and downstream consumers keep working
                   "speedup": float} | None,
         "candidates": [           # per-candidate results, or None
             {"name": str,
@@ -98,7 +102,10 @@ def _utcnow() -> str:
 
 
 def splice_body(cpp_path: str | Path, body: str) -> None:
-    """Splice a translated C++ body into ``kernels_jni.cpp``.
+    """Splice a translated native body into the generated glue file.
+
+    Works on both backends' native sources -- ``kernels_jni.cpp`` (JNI) and
+    ``kernels_ffm.c`` (FFM) both carry the same marker pair.
 
     Everything between the ``BEGIN TRANSLATED BODY`` and
     ``END TRANSLATED BODY`` markers is replaced with ``body``; the markers
@@ -229,11 +236,13 @@ def _pick_winner_and_table(results: list[dict]) -> tuple[str | None, str]:
     return winner_name, "\n".join(rows)
 
 
-def _base_report(status: str, method: J.MethodInfo, ext, work_dir: Path, glue_dir: Path) -> dict:
+def _base_report(status: str, method: J.MethodInfo, ext, work_dir: Path, glue_dir: Path,
+                 backend: str) -> dict:
     return {
         "status": status,
         "method": method.qualname,
         "signature": method.signature,
+        "backend": backend,
         "purity": {
             "pure": bool(ext.purity.pure),
             "reasons": list(ext.purity.reasons),
@@ -262,11 +271,19 @@ def _verify_summary(vrep) -> dict:
     }
 
 
-def _bench_summary(brep) -> dict:
+def _bench_summary(brep, backend: str = "jni") -> dict:
     return {
+        "backend": backend,
         "java_per_call_ns": float(brep.java_per_call_ns),
         "jni_per_call_ns": float(brep.jni_per_call_ns),
         "speedup": float(brep.speedup),
+        "verdict": brep.verdict,
+        "jni_overhead_ns": (
+            float(brep.jni_overhead_ns) if brep.jni_overhead_ns is not None else None
+        ),
+        "rust_overhead_ns": (
+            float(brep.rust_overhead_ns) if brep.rust_overhead_ns is not None else None
+        ),
     }
 
 
@@ -292,6 +309,9 @@ def run_pipeline(
     warmup=200,
     repeats=3,
     rigorous=False,
+    tol_float=1e-6,
+    tol_double=1e-12,
+    backend: str = "jni",
 ) -> dict:
     """Run mine -> extract -> glue -> verify -> bench for one kernel.
 
@@ -302,9 +322,26 @@ def run_pipeline(
     without a cache hit) the pipeline stops after glue with
     ``status="awaiting_translation"``.
 
+    ``backend`` selects the glue/verify/bench path: ``"jni"`` (default,
+    ``kernels_jni.cpp``), ``"ffm"`` (Panama Foreign Function & Memory,
+    ``kernels_ffm.c``) or ``"rust"`` (Rust cdylib via the jni crate,
+    ``src/lib.rs``). ``harness.build_env`` and the candidate loop both
+    follow this choice.
+
     ``rigorous=True`` requests JMH-style benchmarking; the v0.1 harness only
     does wall-clock timing, so the report records that the request fell back.
     """
+    if backend not in ("jni", "ffm", "rust"):
+        return {
+            "status": "error",
+            "method": method,
+            "backend": backend,
+            "instructions": (
+                f"Unknown backend {backend!r}: expected 'jni', 'ffm' or 'rust'. "
+                "Only those three glue/verify/bench backends are implemented."
+            ),
+            "generated_at": _utcnow(),
+        }
     repo_root = Path(repo)
 
     # Resolve dirs: work_dir defaults under glue_out; everything str()-able.
@@ -326,17 +363,22 @@ def run_pipeline(
         return {
             "status": "error",
             "method": method,
+            "backend": backend,
             "instructions": f"Could not scan repo {repo_root}: {exc}",
             "generated_at": _utcnow(),
         }
     try:
         if method is not None:
-            m = r.find_method(method)
-            if m is None:
+            from . import overloading
+
+            try:
+                m = overloading.parse_method_ref(r, method)
+            except (overloading.AmbiguityError, LookupError) as exc:
                 return {
                     "status": "error",
                     "method": method,
-                    "instructions": f"Method not found in repo: {method}",
+                    "backend": backend,
+                    "instructions": str(exc),
                     "generated_at": _utcnow(),
                 }
         else:
@@ -345,6 +387,7 @@ def run_pipeline(
                 return {
                     "status": "error",
                     "method": None,
+                    "backend": backend,
                     "instructions": (
                         f"No pure kernel candidates found in {repo_root}. "
                         "Pass an explicit method name or fix purity."
@@ -358,21 +401,25 @@ def run_pipeline(
         return {
             "status": "error",
             "method": method,
+            "backend": backend,
             "instructions": f"Method resolution failed: {exc}",
             "generated_at": _utcnow(),
         }
 
     # 2. extract + purity gate
     try:
-        ext = extractor.extract(r, m.qualname)
+        # Pass the original ref (it may carry a v0.4 `(types)` overload suffix);
+        # m.qualname is the bare name and would re-trigger ambiguity.
+        ext = extractor.extract(r, method if method is not None else m.qualname)
     except ValueError as exc:
         return {
             "status": "error",
             "method": m.qualname,
+            "backend": backend,
             "instructions": str(exc),
             "generated_at": _utcnow(),
         }
-    report = _base_report("rejected", m, ext, work_dir, glue_dir)
+    report = _base_report("rejected", m, ext, work_dir, glue_dir, backend)
     if not ext.purity.pure:
         report["instructions"] = (
             f"{m.qualname} is not pure; the pipeline refuses to port it. "
@@ -411,28 +458,46 @@ def run_pipeline(
 
     # 4. glue
     try:
-        files = jni.generate(m, glue_dir)
+        if backend == "ffm":
+            ffm_mod = _optional_module("ffm")
+            if ffm_mod is None:
+                raise ValueError(
+                    "backend='ffm' requested but kernel_port.ffm is not available"
+                )
+            files = ffm_mod.generate(m, glue_dir, package=jni.glue_package(r, m))
+            native_path = files["c"]  # kernels_ffm.c
+        elif backend == "rust":
+            rust_mod = _optional_module("rust_glue")
+            if rust_mod is None:
+                raise ValueError(
+                    "backend='rust' requested but kernel_port.rust_glue is not available"
+                )
+            files = rust_mod.generate(m, glue_dir, package=jni.glue_package(r, m))
+            native_path = files["rust"]  # src/lib.rs
+        else:
+            files = jni.generate(m, glue_dir, package=jni.glue_package(r, m))
+            native_path = files["cpp"]  # kernels_jni.cpp
     except ValueError as exc:
         report["status"] = "error"
         report["instructions"] = f"Glue generation failed for {m.qualname}: {exc}"
         return report
-    cpp_path = files["cpp"]
 
     # 5. no translation yet -> stop after glue
+    lang = {"ffm": "C", "rust": "Rust"}.get(backend, "C++")
     if translated_body is None and candidates_dir is None:
         prompt_path = work_dir / "prompt_material.md"
-        prompt_path.write_text(extractor.render_text(ext), encoding="utf-8")
+        prompt_path.write_text(extractor.render_text(ext, backend), encoding="utf-8")
         report["status"] = "awaiting_translation"
         report["instructions"] = (
-            f"Glue generated in {glue_dir}. The C++ translation is still missing.\n"
+            f"Glue generated in {glue_dir}. The {lang} translation is still missing.\n"
             f"1. Read the translation brief: {prompt_path}\n"
-            f"2. Paste the translated body of {m.qualname} into {cpp_path},\n"
+            f"2. Paste the translated body of {m.qualname} into {native_path},\n"
             "   replacing everything between the markers\n"
             "   `// ==== BEGIN TRANSLATED BODY ====` and\n"
             "   `// ==== END TRANSLATED BODY ====` (the `TODO(agent)` placeholder).\n"
             "   `#include` lines in your translation are hoisted into the\n"
             "   file's include block automatically.\n"
-            "3. Re-run run_pipeline with translated_body=<the C++ code>, "
+            f"3. Re-run run_pipeline with translated_body=<the {lang} code>, "
             "or run `kernel-port verify` / `kernel-port bench` "
             f"with --glue-dir {glue_dir}."
         )
@@ -444,7 +509,7 @@ def run_pipeline(
         if isinstance(translated_body, Path):
             translated_body = translated_body.read_text(encoding="utf-8")
         try:
-            splice_body(cpp_path, str(translated_body))
+            splice_body(native_path, str(translated_body))
         except ValueError as exc:
             report["status"] = "error"
             report["instructions"] = str(exc)
@@ -452,7 +517,10 @@ def run_pipeline(
 
         # 7. build + verify + bench
         try:
-            env = harness.build_env(repo_root, m, glue_dir, work_dir / "build")
+            env = harness.build_env(
+                repo_root, m, glue_dir, work_dir / "build", backend=backend,
+                repo=r,
+            )
         except (RuntimeError, ValueError) as exc:
             report["status"] = "error"
             report["instructions"] = (
@@ -461,7 +529,8 @@ def run_pipeline(
             )
             return report
 
-        vrep = harness.run_verify(env, cases=cases, seed=seed)
+        vrep = harness.run_verify(env, cases=cases, seed=seed,
+                                  tol_float=tol_float, tol_double=tol_double)
         report["verify"] = _verify_summary(vrep)
 
         if not vrep.all_passed:
@@ -474,18 +543,14 @@ def run_pipeline(
                 f"Verification FAILED: {vrep.failed}/{vrep.passed + vrep.failed} cases "
                 f"mismatched. Counterexamples were written to "
                 f"{report['counterexamples_path']} -- feed that file back to the "
-                "translator, fix the C++ body, and re-run the pipeline."
+                f"translator, fix the {lang} body, and re-run the pipeline."
             )
         else:
             brep = harness.run_bench(env, iters=iters, warmup=warmup, repeats=repeats)
-            report["bench"] = _bench_summary(brep)
+            report["bench"] = _bench_summary(brep, backend=backend)
             report["status"] = "success"
-            speed = brep.speedup
-            verdict = (
-                f"JNI is {speed:.2f}x faster (median per call)"
-                if speed >= 1
-                else f"JNI is {1/speed:.2f}x slower (median per call)"
-            )
+            label = {"ffm": "FFM", "rust": "Rust"}.get(backend, "JNI")
+            verdict = brep.verdict_text(f"{label} native")
             note = (
                 " Note: rigorous=True was requested but the v0.1 harness only "
                 "supports wall-clock timing; used wall-clock median instead."
@@ -501,6 +566,8 @@ def run_pipeline(
         report["candidates"] = _run_candidates(
             repo_root, m, glue_dir, work_dir, Path(candidates_dir),
             cases=cases, seed=seed, iters=iters, warmup=warmup, repeats=repeats,
+            tol_float=tol_float, tol_double=tol_double, backend=backend,
+            repo=r,
         )
         winner, table = _pick_winner_and_table(report["candidates"])
         report["winner"] = winner
@@ -559,34 +626,61 @@ def _run_candidates(
     iters: int,
     warmup: int,
     repeats: int,
+    tol_float: float = 1e-6,
+    tol_double: float = 1e-12,
+    backend: str = "jni",
+    repo: J.JavaRepo | None = None,
 ) -> list[dict]:
-    """Build + verify + bench every *.cpp in candidates_dir.
+    """Build + verify + bench every candidate file in candidates_dir.
 
     Each file is treated as an alternative translated *body*: it is spliced
     into a fresh copy of the glue (unless the file already contains the
-    translation markers, in which case it is used as the full kernels_jni.cpp).
+    translation markers, in which case it is used as the full native source
+    file). For the ``ffm`` backend, ``*.c`` and ``*.cpp`` files are both
+    considered (the glue is ``kernels_ffm.c``); for ``jni``, only ``*.cpp``.
     """
     results: list[dict] = []
     cand_root = work_dir / "candidates"
-    for cand_file in sorted(candidates_dir.glob("*.cpp")):
+    patterns = ("*.c", "*.cpp") if backend == "ffm" else ("*.cpp",)
+    cand_files = sorted(
+        {p for pattern in patterns for p in candidates_dir.glob(pattern)}
+    )
+    for cand_file in cand_files:
         name = cand_file.stem
         res: dict = {"name": name}
         cand_glue = cand_root / name
         try:
-            files = jni.generate(method, cand_glue)
+            if backend == "ffm":
+                ffm_mod = _optional_module("ffm")
+                if ffm_mod is None:
+                    raise ValueError(
+                        "backend='ffm' requested but kernel_port.ffm is not "
+                        "available"
+                    )
+                files = ffm_mod.generate(
+                    method, cand_glue, package=jni.glue_package(repo, method)
+                )
+                native_path = files["c"]  # kernels_ffm.c
+            else:
+                files = jni.generate(
+                    method, cand_glue, package=jni.glue_package(repo, method)
+                )
+                native_path = files["cpp"]  # kernels_jni.cpp
             text = cand_file.read_text(encoding="utf-8")
             if _BEGIN_MARKER in text and _END_MARKER in text:
-                files["cpp"].write_text(text, encoding="utf-8")
+                native_path.write_text(text, encoding="utf-8")
             else:
-                splice_body(files["cpp"], text)
+                splice_body(native_path, text)
             env = harness.build_env(
-                repo_root, method, cand_glue, cand_root / name / ".kp-work"
+                repo_root, method, cand_glue, cand_root / name / ".kp-work",
+                backend=backend, repo=repo,
             )
         except Exception as exc:
             res["error"] = f"{type(exc).__name__}: {exc}"
             results.append(res)
             continue
-        vrep = harness.run_verify(env, cases=cases, seed=seed)
+        vrep = harness.run_verify(env, cases=cases, seed=seed,
+                                  tol_float=tol_float, tol_double=tol_double)
         res["verify_passed"] = vrep.passed
         res["verify_failed"] = vrep.failed
         res["verify_skipped"] = vrep.skipped
@@ -595,6 +689,7 @@ def _run_candidates(
             res["java_per_call_ns"] = float(brep.java_per_call_ns)
             res["jni_per_call_ns"] = float(brep.jni_per_call_ns)
             res["speedup"] = float(brep.speedup)
+            res["verdict"] = brep.verdict
             res["bench_median_ns"] = float(brep.jni_per_call_ns)
         results.append(res)
     return results
