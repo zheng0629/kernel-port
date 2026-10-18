@@ -107,13 +107,13 @@ CodeMorph、SwapCode 之类只是"粘贴代码→吐翻译"的网页：没有仓
 - Python ≥ 3.10
 - JDK 17+ 和 `g++` 在 `PATH` 中 —— `verify` / `bench` 需要编译并运行两边代码
 - `--backend ffm` 需要 JDK 22+（推荐 25 LTS），低版本会明确报错
-- `mcp` Python 包 —— 仅 `kernel-port mcp` 需要（`pip install 'kernel-port[mcp]'`）
+- `mcp` Python 包 —— 仅 `kernel-port mcp` 需要（`pip install 'kernel-port-agent[mcp]'`）
 - `cargo` —— 仅 `--backend rust` 需要
 
 ## 安装
 
 ```bash
-pip install kernel-port
+pip install kernel-port-agent
 # 或从源码：
 pip install -e .
 ```

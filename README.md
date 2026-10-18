@@ -107,13 +107,13 @@ Existing tools (CodeMorph, SwapCode, …) are paste-code-in / get-translation-ou
 - Python ≥ 3.10
 - A JDK (17+) and `g++` on `PATH` — needed for `verify` / `bench` (they compile and run both sides)
 - `--backend ffm` needs JDK 22+ (25 LTS recommended); it refuses with a clear error on older JDKs
-- `mcp` Python package — only needed for `kernel-port mcp` (`pip install 'kernel-port[mcp]'`)
+- `mcp` Python package — only needed for `kernel-port mcp` (`pip install 'kernel-port-agent[mcp]'`)
 - `cargo` — only needed for `--backend rust`
 
 ## Install
 
 ```bash
-pip install kernel-port
+pip install kernel-port-agent
 # or from source:
 pip install -e .
 ```
