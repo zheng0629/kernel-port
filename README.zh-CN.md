@@ -118,6 +118,8 @@ pip install kernel-port-agent
 pip install -e .
 ```
 
+**给 agent 看的：** 仓库根目录带有一份 [SKILL.md](SKILL.md)（Agent Skills 格式），支持 skill 的 agent 可直接发现并调用本工具链。
+
 ## 快速上手
 
 ```bash

@@ -118,6 +118,8 @@ pip install kernel-port-agent
 pip install -e .
 ```
 
+**For agents:** this repo ships a [SKILL.md](SKILL.md) (Agent Skills format) so skill-compatible agents can discover and drive the toolchain directly.
+
 ## Quick start
 
 ```bash
